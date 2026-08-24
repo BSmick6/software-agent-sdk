@@ -303,6 +303,22 @@ def test_delete_conversation_tag(client, mock_conversation_service):
         client.app.dependency_overrides.clear()
 
 
+def test_delete_conversation_tag_invalid_key(client, mock_conversation_service):
+    """DELETE /tags/{key} returns 422 for an invalid tag key."""
+    client.app.dependency_overrides[get_conversation_service] = (
+        lambda: mock_conversation_service
+    )
+
+    conversation_id = uuid4()
+    try:
+        response = client.delete(
+            f"/api/conversations/{conversation_id}/tags/INVALID-KEY",
+        )
+        assert response.status_code == 422
+    finally:
+        client.app.dependency_overrides.clear()
+
+
 def test_delete_conversation_tag_missing_conversation(
     client, mock_conversation_service
 ):

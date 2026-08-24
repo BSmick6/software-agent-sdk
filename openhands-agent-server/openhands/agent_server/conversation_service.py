@@ -1873,6 +1873,10 @@ class ConversationService:
             record.stored = event_service.stored
             record.cached_info = None
         await event_service.save_meta()
+        conversation_info = await loop.run_in_executor(
+            None, _compose_webhook_conversation_info_sync, event_service.stored, state
+        )
+        await self._notify_conversation_webhooks(conversation_info)
         logger.info("Set tag '%s' on conversation %s", key, conversation_id)
         return True
 
@@ -1902,6 +1906,10 @@ class ConversationService:
             record.stored = event_service.stored
             record.cached_info = None
         await event_service.save_meta()
+        conversation_info = await loop.run_in_executor(
+            None, _compose_webhook_conversation_info_sync, event_service.stored, state
+        )
+        await self._notify_conversation_webhooks(conversation_info)
         logger.info("Deleted tag '%s' from conversation %s", key, conversation_id)
         return True
 
