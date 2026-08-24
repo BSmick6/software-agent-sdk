@@ -1851,6 +1851,60 @@ class ConversationService:
         )
         return True
 
+    async def set_conversation_tag(
+        self, conversation_id: UUID, key: str, value: str
+    ) -> bool:
+        """Set a single tag on a conversation without touching ``updated_at``.
+
+        Returns:
+            bool: True if the tag was set, False if the conversation was not found.
+        """
+        event_service = await self._get_or_load_event_service(conversation_id)
+        if event_service is None:
+            return False
+
+        loop = asyncio.get_running_loop()
+        state = await event_service.get_state()
+        event_service.stored.tags[key] = value
+        new_tags = dict(event_service.stored.tags)
+        await loop.run_in_executor(None, _update_state_tags_sync, state, new_tags)
+        record = self._conversation_records.get(conversation_id)
+        if record is not None:
+            record.stored = event_service.stored
+            record.cached_info = None
+        await event_service.save_meta()
+        logger.info("Set tag '%s' on conversation %s", key, conversation_id)
+        return True
+
+    async def delete_conversation_tag(
+        self, conversation_id: UUID, key: str
+    ) -> bool | None:
+        """Remove a single tag from a conversation without touching ``updated_at``.
+
+        Returns:
+            True if the tag was removed, None if the key did not exist,
+            False if the conversation was not found.
+        """
+        event_service = await self._get_or_load_event_service(conversation_id)
+        if event_service is None:
+            return False
+
+        if key not in event_service.stored.tags:
+            return None
+
+        loop = asyncio.get_running_loop()
+        state = await event_service.get_state()
+        del event_service.stored.tags[key]
+        new_tags = dict(event_service.stored.tags)
+        await loop.run_in_executor(None, _update_state_tags_sync, state, new_tags)
+        record = self._conversation_records.get(conversation_id)
+        if record is not None:
+            record.stored = event_service.stored
+            record.cached_info = None
+        await event_service.save_meta()
+        logger.info("Deleted tag '%s' from conversation %s", key, conversation_id)
+        return True
+
     async def get_event_service(self, conversation_id: UUID) -> EventService | None:
         return await self._get_or_load_event_service(conversation_id)
 

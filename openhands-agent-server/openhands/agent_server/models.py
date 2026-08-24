@@ -468,6 +468,15 @@ class SetSecurityAnalyzerRequest(BaseModel):
     )
 
 
+class SetTagRequest(BaseModel):
+    """Payload to set a single conversation tag."""
+
+    value: str = Field(
+        description="Tag value (arbitrary string, up to 256 characters)",
+        max_length=256,
+    )
+
+
 class UpdateConversationRequest(BaseModel):
     """Payload to update conversation metadata."""
 
