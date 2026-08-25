@@ -1,5 +1,6 @@
 """Tests for conversation tags in the API layer."""
 
+import json
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
@@ -465,3 +466,53 @@ async def test_event_service_start_forwards_observability_span_name(tmp_path):
         MockConversation.assert_called_once()
         call_kwargs = MockConversation.call_args.kwargs
         assert call_kwargs["observability_span_name"] == "pr_review_evaluation"
+
+
+@pytest.mark.asyncio
+async def test_set_delete_tag_persists_to_disk(tmp_path):
+    """set/delete_conversation_tag mutate stored.tags and persist to meta.json."""
+    stored = StoredConversation(
+        id=uuid4(),
+        workspace=LocalWorkspace(working_dir=str(tmp_path / "workspace")),
+        confirmation_policy=NeverConfirm(),
+        tags={"env": "test"},
+        created_at=datetime(2025, 1, 1, 12, 0, 0, tzinfo=UTC),
+        updated_at=datetime(2025, 1, 1, 12, 0, 0, tzinfo=UTC),
+    )
+    conversations_dir = tmp_path / "conversations"
+    conv_dir = conversations_dir / stored.id.hex
+    conv_dir.mkdir(parents=True)
+    (conv_dir / "meta.json").write_text(stored.model_dump_json())
+
+    # Build an EventService that bypasses LocalConversation startup.
+    event_service = EventService(
+        stored=stored,
+        conversations_dir=conversations_dir,
+        agent=None,
+    )
+    mock_state = MagicMock()
+    mock_state.__enter__ = MagicMock(return_value=mock_state)
+    mock_state.__exit__ = MagicMock(return_value=False)
+    event_service._conversation = MagicMock()
+    event_service._conversation._state = mock_state
+
+    with patch(
+        "openhands.agent_server.conversation_service"
+        "._compose_webhook_conversation_info_sync",
+        return_value=MagicMock(),
+    ):
+        async with ConversationService(conversations_dir=conversations_dir) as service:
+            assert service._event_services is not None
+            service._event_services[stored.id] = event_service
+
+            result = await service.set_conversation_tag(stored.id, "team", "backend")
+            assert result is True
+            assert event_service.stored.tags == {"env": "test", "team": "backend"}
+            meta = json.loads((conv_dir / "meta.json").read_text())
+            assert meta["tags"] == {"env": "test", "team": "backend"}
+
+            result = await service.delete_conversation_tag(stored.id, "env")
+            assert result is True
+            assert "env" not in event_service.stored.tags
+            meta = json.loads((conv_dir / "meta.json").read_text())
+            assert "env" not in meta.get("tags", {})

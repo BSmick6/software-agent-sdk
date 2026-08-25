@@ -1851,6 +1851,23 @@ class ConversationService:
         )
         return True
 
+    async def _flush_tags_mutation(
+        self, event_service: "EventService", conversation_id: UUID
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        state = await event_service.get_state()
+        new_tags = dict(event_service.stored.tags)
+        await loop.run_in_executor(None, _update_state_tags_sync, state, new_tags)
+        record = self._conversation_records.get(conversation_id)
+        if record is not None:
+            record.stored = event_service.stored
+            record.cached_info = None
+        await event_service.save_meta()
+        conversation_info = await loop.run_in_executor(
+            None, _compose_webhook_conversation_info_sync, event_service.stored, state
+        )
+        await self._notify_conversation_webhooks(conversation_info)
+
     async def set_conversation_tag(
         self, conversation_id: UUID, key: str, value: str
     ) -> bool:
@@ -1863,20 +1880,8 @@ class ConversationService:
         if event_service is None:
             return False
 
-        loop = asyncio.get_running_loop()
-        state = await event_service.get_state()
         event_service.stored.tags[key] = value
-        new_tags = dict(event_service.stored.tags)
-        await loop.run_in_executor(None, _update_state_tags_sync, state, new_tags)
-        record = self._conversation_records.get(conversation_id)
-        if record is not None:
-            record.stored = event_service.stored
-            record.cached_info = None
-        await event_service.save_meta()
-        conversation_info = await loop.run_in_executor(
-            None, _compose_webhook_conversation_info_sync, event_service.stored, state
-        )
-        await self._notify_conversation_webhooks(conversation_info)
+        await self._flush_tags_mutation(event_service, conversation_id)
         logger.info("Set tag '%s' on conversation %s", key, conversation_id)
         return True
 
@@ -1896,20 +1901,8 @@ class ConversationService:
         if key not in event_service.stored.tags:
             return None
 
-        loop = asyncio.get_running_loop()
-        state = await event_service.get_state()
         del event_service.stored.tags[key]
-        new_tags = dict(event_service.stored.tags)
-        await loop.run_in_executor(None, _update_state_tags_sync, state, new_tags)
-        record = self._conversation_records.get(conversation_id)
-        if record is not None:
-            record.stored = event_service.stored
-            record.cached_info = None
-        await event_service.save_meta()
-        conversation_info = await loop.run_in_executor(
-            None, _compose_webhook_conversation_info_sync, event_service.stored, state
-        )
-        await self._notify_conversation_webhooks(conversation_info)
+        await self._flush_tags_mutation(event_service, conversation_id)
         logger.info("Deleted tag '%s' from conversation %s", key, conversation_id)
         return True
 
