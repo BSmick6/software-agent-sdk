@@ -613,7 +613,7 @@ async def update_conversation(
     return Success()
 
 
-@conversation_router.post(
+@conversation_router.put(
     "/{conversation_id}/tags/{key}",
     responses={404: {"description": "Conversation not found"}},
 )

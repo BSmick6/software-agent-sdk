@@ -235,7 +235,7 @@ def test_set_conversation_tag(client, mock_conversation_service):
 
     conversation_id = uuid4()
     try:
-        response = client.post(
+        response = client.put(
             f"/api/conversations/{conversation_id}/tags/env",
             json={"value": "production"},
         )
@@ -257,7 +257,7 @@ def test_set_conversation_tag_missing_conversation(client, mock_conversation_ser
 
     conversation_id = uuid4()
     try:
-        response = client.post(
+        response = client.put(
             f"/api/conversations/{conversation_id}/tags/env",
             json={"value": "production"},
         )
@@ -274,7 +274,7 @@ def test_set_conversation_tag_invalid_key(client, mock_conversation_service):
 
     conversation_id = uuid4()
     try:
-        response = client.post(
+        response = client.put(
             f"/api/conversations/{conversation_id}/tags/INVALID-KEY",
             json={"value": "value"},
         )
@@ -367,7 +367,7 @@ def test_set_tag_does_not_affect_other_tags(client, mock_conversation_service):
 
     conversation_id = uuid4()
     try:
-        response = client.post(
+        response = client.put(
             f"/api/conversations/{conversation_id}/tags/repo",
             json={"value": "myorg/myrepo"},
         )

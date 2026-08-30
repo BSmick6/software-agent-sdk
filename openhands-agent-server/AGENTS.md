@@ -122,7 +122,7 @@ tag map without a read-modify-write round-trip:
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/api/conversations/{id}/tags/{key}` | Set or overwrite one tag; body: `{"value": "..."}` |
+| `PUT` | `/api/conversations/{id}/tags/{key}` | Set or overwrite one tag; body: `{"value": "..."}` |
 | `DELETE` | `/api/conversations/{id}/tags/{key}` | Remove one tag |
 
 Both operations leave all other tags untouched and **do not update `updated_at`**
