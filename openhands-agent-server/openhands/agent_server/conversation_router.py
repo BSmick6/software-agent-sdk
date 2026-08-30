@@ -628,7 +628,7 @@ async def set_conversation_tag(
     All other tags on the conversation are left unchanged.
     Does not update the conversation's ``updated_at`` timestamp.
     """
-    if not TAG_KEY_PATTERN.match(key):
+    if not TAG_KEY_PATTERN.fullmatch(key):
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Tag key must be lowercase alphanumeric only",
@@ -656,7 +656,7 @@ async def delete_conversation_tag(
     Returns 404 if the conversation does not exist or the key is not present.
     Does not update the conversation's ``updated_at`` timestamp.
     """
-    if not TAG_KEY_PATTERN.match(key):
+    if not TAG_KEY_PATTERN.fullmatch(key):
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Tag key must be lowercase alphanumeric only",

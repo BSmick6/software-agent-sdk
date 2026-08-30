@@ -19,7 +19,7 @@ from openhands.sdk.conversation.request import (  # re-export for backward compa
 )
 from openhands.sdk.conversation.secret_registry import SecretRegistry
 from openhands.sdk.conversation.state import ConversationExecutionStatus
-from openhands.sdk.conversation.types import ConversationTags
+from openhands.sdk.conversation.types import TAG_VALUE_MAX_LENGTH, ConversationTags
 from openhands.sdk.event.base import Event
 from openhands.sdk.hooks import HookConfig
 from openhands.sdk.llm.message import (  # re-export
@@ -473,7 +473,7 @@ class SetTagRequest(BaseModel):
 
     value: str = Field(
         description="Tag value (arbitrary string, up to 256 characters)",
-        max_length=256,
+        max_length=TAG_VALUE_MAX_LENGTH,
     )
 
 

@@ -508,11 +508,13 @@ async def test_set_delete_tag_persists_to_disk(tmp_path):
             result = await service.set_conversation_tag(stored.id, "team", "backend")
             assert result is True
             assert event_service.stored.tags == {"env": "test", "team": "backend"}
+            assert event_service.stored.updated_at == stored.updated_at  # must not change
             meta = json.loads((conv_dir / "meta.json").read_text())
             assert meta["tags"] == {"env": "test", "team": "backend"}
 
             result = await service.delete_conversation_tag(stored.id, "env")
             assert result is True
             assert "env" not in event_service.stored.tags
+            assert event_service.stored.updated_at == stored.updated_at  # must not change
             meta = json.loads((conv_dir / "meta.json").read_text())
             assert "env" not in meta.get("tags", {})
