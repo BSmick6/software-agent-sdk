@@ -1854,6 +1854,15 @@ class ConversationService:
     async def _flush_tags_mutation(
         self, event_service: "EventService", conversation_id: UUID
     ) -> None:
+        """Persist a tag mutation to state, disk, and webhooks.
+
+        Intentionally does NOT update ``stored.updated_at`` — per-key tag
+        mutations are metadata-only and must not perturb conversation sort order
+        or trigger localStorage-to-server migration checks (see AGENTS.md).
+
+        The state lock is acquired inside ``_update_state_tags_sync`` via
+        ``run_in_executor`` so it does not block the event loop.
+        """
         loop = asyncio.get_running_loop()
         state = await event_service.get_state()
         new_tags = dict(event_service.stored.tags)
