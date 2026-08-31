@@ -19,6 +19,12 @@ ARG ENABLE_VERTEX=0
 # shipped today; an unknown key fails the build rather than silently
 # installing nothing.
 ARG INSTALL_ACP_PROVIDERS=claude-code,codex,gemini-cli
+# Comma-separated capability keys to include in the `base-image` stage below
+# (`base-image-minimal` is unaffected). The default reproduces today's full
+# contents; an unknown key fails the build. The GitHub CLI is expected to
+# join this list later (see OpenHands/software-agent-sdk#4645) — the parsing
+# below is written so that's a one-case addition, not a signature change.
+ARG INSTALL_CAPABILITIES=vscode,browser,desktop,docker
 
 ####################################################################################
 # Builder (source mode)
@@ -277,16 +283,45 @@ EXPOSE ${PORT}
 ####################################################################################
 FROM base-image-minimal AS base-image
 ARG USERNAME
+ARG INSTALL_CAPABILITIES
 
 USER root
+
+# Fail fast on a typo'd capability name before spending any time on the
+# installs below (each block only checks for ITS OWN keyword's presence, so
+# an unrecognized one would otherwise be silently ignored rather than erroring).
+RUN set -eux; \
+    for capability in $(echo "$INSTALL_CAPABILITIES" | tr ',' ' '); do \
+      case "$capability" in \
+        vscode|browser|desktop|docker) ;; \
+        *) echo "Unknown capability '$capability' in INSTALL_CAPABILITIES" \
+             "(expected one of: vscode, browser, desktop, docker)" >&2; exit 1;; \
+      esac; \
+    done
+
 # --- VSCode Web ---
+# EDITOR/VISUAL/GIT_EDITOR/OPENVSCODE_SERVER_ROOT are declared unconditionally:
+# nothing execs `code` unless VSCode Web itself is running, so a dangling
+# path when `vscode` is excluded is harmless (same reasoning as CHROME_BIN
+# below, applied to VSCode).
 ENV EDITOR=code \
     VISUAL=code \
     GIT_EDITOR="code --wait" \
     OPENVSCODE_SERVER_ROOT=/openhands/.openvscode-server
 ARG RELEASE_TAG="openvscode-server-v1.98.2"
 ARG RELEASE_ORG="gitpod-io"
+# The --mount=from=builder on the extensions RUN below is unconditional at
+# the Dockerfile level, so BuildKit still builds the full `builder` stage
+# (the entire SDK venv) even when `vscode` is excluded from
+# INSTALL_CAPABILITIES — the case check inside each RUN only decides what
+# lands in THIS image, not what gets built as a dependency. Excluding vscode
+# shrinks the result, not the build time.
 RUN set -eux; \
+    case ",$INSTALL_CAPABILITIES," in \
+      *,vscode,*) ;; \
+      *) echo "INSTALL_CAPABILITIES excludes vscode; skipping OpenVSCode Server"; exit 0;; \
+    esac; \
+    \
     # Create necessary directories
     mkdir -p $(dirname ${OPENVSCODE_SERVER_ROOT}); \
     \
@@ -311,13 +346,31 @@ RUN set -eux; \
     # Set proper ownership
     chown -R ${USERNAME}:${USERNAME} ${OPENVSCODE_SERVER_ROOT}
 
-
-# Include VSCode extensions alongside the server so targets inheriting base-image
-# implicitly get the extensions; minimal images (without VSCode) won't.
-COPY --chown=${USERNAME}:${USERNAME} --from=builder /agent-server/openhands-agent-server/openhands/agent_server/vscode_extensions ${OPENVSCODE_SERVER_ROOT}/extensions
+# Kept as its own RUN, separate from the tarball download above: extensions
+# are actively-edited local source (unlike the pinned release tarball), so
+# splitting them keeps an extension-only change from invalidating the ~100MB
+# download's cache layer.
+RUN --mount=type=bind,from=builder,source=/agent-server/openhands-agent-server/openhands/agent_server/vscode_extensions,target=/tmp/vscode_extensions \
+    set -eux; \
+    case ",$INSTALL_CAPABILITIES," in \
+      *,vscode,*) ;; \
+      *) exit 0;; \
+    esac; \
+    \
+    # Trailing slashes matter: OpenVSCode Server's tarball already ships its
+    # own extensions/ dir, so a bare `cp -r src dst` would nest src under the
+    # existing dst instead of merging into it the way `COPY` does.
+    mkdir -p ${OPENVSCODE_SERVER_ROOT}/extensions; \
+    cp -r /tmp/vscode_extensions/. ${OPENVSCODE_SERVER_ROOT}/extensions/; \
+    chown -R ${USERNAME}:${USERNAME} ${OPENVSCODE_SERVER_ROOT}/extensions
 
 # --- Docker ---
 RUN set -eux; \
+    case ",$INSTALL_CAPABILITIES," in \
+      *,docker,*) ;; \
+      *) echo "INSTALL_CAPABILITIES excludes docker; skipping Docker Engine"; exit 0;; \
+    esac; \
+    \
     # Determine OS type and install Docker accordingly
     if grep -q "ubuntu" /etc/os-release; then \
         # Handle Ubuntu
@@ -336,10 +389,10 @@ RUN set -eux; \
     apt-get update; \
     apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin; \
     apt-get clean; \
-    rm -rf /var/lib/apt/lists/*
-
-# Configure Docker daemon with MTU 1450 to prevent packet fragmentation issues
-RUN mkdir -p /etc/docker && \
+    rm -rf /var/lib/apt/lists/*; \
+    \
+    # Configure Docker daemon with MTU 1450 to prevent packet fragmentation issues
+    mkdir -p /etc/docker; \
     echo '{"mtu": 1450}' > /etc/docker/daemon.json
 
 # --- GitHub CLI ---
@@ -356,15 +409,10 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*
 
 # --- VNC + Desktop + noVNC ---
-RUN set -eux; \
-  apt-get update; \
-  apt-get install -y --no-install-recommends \
-    # GUI bits (remove entirely if headless)
-    tigervnc-standalone-server xfce4 dbus-x11 novnc websockify \
-    # Browser
-    $(if grep -q "ubuntu" /etc/os-release; then echo "chromium-browser"; else echo "chromium"; fi); \
-  apt-get clean; rm -rf /var/lib/apt/lists/*
-
+# `desktop` (tigervnc/xfce4/dbus-x11/novnc/websockify) and `browser`
+# (chromium) are independently selectable: BrowserToolSet needs Chromium but
+# not the desktop stack, so bundling them forced every browser consumer to
+# also carry XFCE/VNC/noVNC. See OpenHands/software-agent-sdk#4645.
 ENV NOVNC_WEB=/usr/share/novnc \
     NOVNC_PORT=8002 \
     DISPLAY=:1 \
@@ -373,9 +421,38 @@ ENV NOVNC_WEB=/usr/share/novnc \
     PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium \
     CHROMIUM_FLAGS="--no-sandbox --disable-dev-shm-usage --disable-gpu"
 
-RUN chown -R ${USERNAME}:${USERNAME} ${NOVNC_WEB}
-# Override default XFCE wallpaper
-COPY --chown=${USERNAME}:${USERNAME} openhands-agent-server/openhands/agent_server/docker/wallpaper.svg /usr/share/backgrounds/xfce/xfce-shapes.svg
+# NOVNC_WEB/CHROME_BIN/PUPPETEER_EXECUTABLE_PATH above are declared
+# unconditionally regardless of which capabilities are selected. Nothing in
+# this repo trusts them as an availability signal — browser_use's chromium
+# detection (openhands-tools/openhands/tools/browser_use/impl.py) does its
+# own filesystem probe of standard install paths — so when `desktop`/
+# `browser` is excluded these simply point at paths that don't exist,
+# rather than causing a false "available" signal downstream.
+RUN --mount=type=bind,source=openhands-agent-server/openhands/agent_server/docker/wallpaper.svg,target=/tmp/wallpaper.svg \
+    set -eux; \
+    WANT_DESKTOP=0; \
+    WANT_BROWSER=0; \
+    case ",$INSTALL_CAPABILITIES," in *,desktop,*) WANT_DESKTOP=1;; esac; \
+    case ",$INSTALL_CAPABILITIES," in *,browser,*) WANT_BROWSER=1;; esac; \
+    PACKAGES=""; \
+    if [ "$WANT_DESKTOP" = "1" ]; then \
+      PACKAGES="$PACKAGES tigervnc-standalone-server xfce4 dbus-x11 novnc websockify"; \
+    fi; \
+    if [ "$WANT_BROWSER" = "1" ]; then \
+      PACKAGES="$PACKAGES $(if grep -q "ubuntu" /etc/os-release; then echo "chromium-browser"; else echo "chromium"; fi)"; \
+    fi; \
+    if [ -n "$PACKAGES" ]; then \
+      apt-get update; \
+      apt-get install -y --no-install-recommends $PACKAGES; \
+      apt-get clean; rm -rf /var/lib/apt/lists/*; \
+    fi; \
+    if [ "$WANT_DESKTOP" = "1" ]; then \
+      chown -R ${USERNAME}:${USERNAME} ${NOVNC_WEB}; \
+      # Override default XFCE wallpaper
+      mkdir -p /usr/share/backgrounds/xfce; \
+      cp /tmp/wallpaper.svg /usr/share/backgrounds/xfce/xfce-shapes.svg; \
+      chown ${USERNAME}:${USERNAME} /usr/share/backgrounds/xfce/xfce-shapes.svg; \
+    fi
 
 USER ${USERNAME}
 WORKDIR /
