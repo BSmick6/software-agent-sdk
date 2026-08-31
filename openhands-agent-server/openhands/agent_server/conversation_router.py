@@ -8,6 +8,7 @@ from fastapi import (
     Body,
     Depends,
     HTTPException,
+    Path,
     Query,
     Request,
     Response,
@@ -619,7 +620,7 @@ async def update_conversation(
 )
 async def set_conversation_tag(
     conversation_id: UUID,
-    key: str,
+    key: Annotated[str, Path(pattern=TAG_KEY_PATTERN.pattern)],
     request: SetTagRequest,
     conversation_service: ConversationService = Depends(get_conversation_service),
 ) -> Success:
@@ -628,11 +629,6 @@ async def set_conversation_tag(
     All other tags on the conversation are left unchanged.
     Does not update the conversation's ``updated_at`` timestamp.
     """
-    if not TAG_KEY_PATTERN.fullmatch(key):
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Tag key must be lowercase alphanumeric only",
-        )
     updated = await conversation_service.set_conversation_tag(
         conversation_id, key, request.value
     )
@@ -647,7 +643,7 @@ async def set_conversation_tag(
 )
 async def delete_conversation_tag(
     conversation_id: UUID,
-    key: str,
+    key: Annotated[str, Path(pattern=TAG_KEY_PATTERN.pattern)],
     conversation_service: ConversationService = Depends(get_conversation_service),
 ) -> Success:
     """Remove a single tag from a conversation.
@@ -656,11 +652,6 @@ async def delete_conversation_tag(
     Returns 404 if the conversation does not exist or the key is not present.
     Does not update the conversation's ``updated_at`` timestamp.
     """
-    if not TAG_KEY_PATTERN.fullmatch(key):
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Tag key must be lowercase alphanumeric only",
-        )
     result = await conversation_service.delete_conversation_tag(conversation_id, key)
     if result is False:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Conversation not found")
