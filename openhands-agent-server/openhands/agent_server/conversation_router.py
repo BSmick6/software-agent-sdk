@@ -633,7 +633,7 @@ async def set_conversation_tag(
         conversation_id, key, request.value
     )
     if not updated:
-        raise HTTPException(status.HTTP_404_NOT_FOUND)
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Conversation not found")
     return Success()
 
 
