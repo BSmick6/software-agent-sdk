@@ -47,10 +47,10 @@ VALID_TARGETS = {
     "builder",
 }
 # Capability keys accepted by the Dockerfile's INSTALL_CAPABILITIES build arg
-# (the `base-image` stage's VSCode Web and VNC/Desktop/Browser blocks). Kept
+# (the `base-image` stage's VSCode Web, browser, and Docker blocks). Kept
 # local to this module since, unlike ACP_PROVIDERS, no other repo/runtime
 # code needs this set.
-AGENT_SERVER_CAPABILITIES = ("vscode", "browser", "desktop", "docker")
+AGENT_SERVER_CAPABILITIES = ("vscode", "browser", "docker")
 _BUILDKIT_STEP_RE = re.compile(r"^#(?P<step>\d+)\s+(?P<message>.+)$")
 _BUILDKIT_DONE_RE = re.compile(r"^DONE\s+(?P<seconds>\d+(?:\.\d+)?)s$")
 _BUILDKIT_INLINE_DONE_RE = re.compile(
@@ -462,10 +462,10 @@ class BuildOptions(BaseModel):
         return v
 
     install_capabilities: str = Field(
-        default="vscode,browser,desktop,docker",
+        default="vscode,browser,docker",
         description=(
             "Comma-separated capability keys to bake into the `base-image` "
-            "stage (VSCode Web, browser, desktop/VNC, Docker Engine). Empty "
+            "stage (VSCode Web, browser, Docker Engine). Empty "
             "string installs none."
         ),
     )
@@ -863,12 +863,11 @@ def build_with_telemetry(opts: BuildOptions) -> BuildResult:
     # build context, direct or transitive). base-image is NOT eligible for
     # this fast path even though it looked context-free at a glance: it pulls
     # in the `builder` stage (for VSCode extensions), and `builder` itself
-    # COPYs the real SDK source from context — plus base-image's own
-    # wallpaper.svg bind mount. Both need the real context, same as
-    # binary/source. This dependency is unconditional at the Dockerfile
-    # level, so excluding vscode from INSTALL_CAPABILITIES shrinks the
-    # resulting image but not this build-context cost or the `builder`
-    # stage's own build time (a full SDK venv sync).
+    # COPYs the real SDK source from context. This dependency is
+    # unconditional at the Dockerfile level, so excluding vscode from
+    # INSTALL_CAPABILITIES shrinks the resulting image but not this
+    # build-context cost or the `builder` stage's own build time (a full SDK
+    # venv sync).
     is_base_only = opts.target == "base-image-minimal"
     if is_base_only:
         ctx = Path(tempfile.mkdtemp(prefix="agent-base-ctx-"))
@@ -1129,7 +1128,7 @@ def main(argv: list[str]) -> int:
         "--install-capabilities",
         # os.environ.get, not _env(): an explicit empty string here means
         # "install none" and must survive, but _env() treats blank as unset.
-        default=os.environ.get("INSTALL_CAPABILITIES", "vscode,browser,desktop,docker"),
+        default=os.environ.get("INSTALL_CAPABILITIES", "vscode,browser,docker"),
         help=(
             "Comma-separated capability keys to bake into the image "
             "(default from $INSTALL_CAPABILITIES; empty string installs none)."
