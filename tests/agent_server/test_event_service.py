@@ -81,7 +81,6 @@ def sample_stored_conversation():
     return StoredConversation(
         id=uuid4(),
         workspace=LocalWorkspace(working_dir="workspace/project"),
-        confirmation_policy=NeverConfirm(),
         initial_message=None,
         metrics=None,
         created_at=datetime(2025, 1, 1, 12, 0, 0, tzinfo=UTC),
@@ -1917,7 +1916,6 @@ class TestEventServiceSaveMeta:
         stored = StoredConversation(
             id=uuid4(),
             workspace=LocalWorkspace(working_dir=str(tmp_path)),
-            confirmation_policy=NeverConfirm(),
             initial_message=None,
             metrics=None,
         )
@@ -1962,7 +1960,6 @@ class TestEventServiceSaveMeta:
         stored = StoredConversation(
             id=uuid4(),
             workspace=LocalWorkspace(working_dir=str(tmp_path)),
-            confirmation_policy=NeverConfirm(),
             initial_message=None,
             metrics=None,
         )
@@ -3114,7 +3111,6 @@ class TestStatsCallbackNoDeadlock:
         stored = StoredConversation(
             id=uuid4(),
             workspace=LocalWorkspace(working_dir="workspace/project"),
-            confirmation_policy=NeverConfirm(),
             initial_message=None,
             metrics=None,
             created_at=datetime(2025, 1, 1, 12, 0, 0, tzinfo=UTC),
@@ -3451,7 +3447,6 @@ def _make_stored(tmp_path: Path) -> StoredConversation:
     return StoredConversation(
         id=uuid4(),
         workspace=LocalWorkspace(working_dir=str(tmp_path)),
-        confirmation_policy=NeverConfirm(),
         initial_message=None,
         metrics=None,
     )
@@ -3526,17 +3521,21 @@ class TestMutationsOwnedByConversationState:
 
     @pytest.mark.asyncio
     async def test_meta_json_excludes_confirmation_policy(self, tmp_path):
-        """confirmation_policy must not appear in meta.json."""
+        """confirmation_policy must not appear in meta.json (it lives on EventService,
+        not StoredConversation, so it is structurally excluded from meta.json)."""
         from openhands.sdk.security.confirmation_policy import AlwaysConfirm
 
         stored = StoredConversation(
             id=uuid4(),
             workspace=LocalWorkspace(working_dir=str(tmp_path)),
-            confirmation_policy=AlwaysConfirm(),
             initial_message=None,
             metrics=None,
         )
-        service = EventService(stored=stored, conversations_dir=tmp_path)
+        service = EventService(
+            stored=stored,
+            conversations_dir=tmp_path,
+            confirmation_policy=AlwaysConfirm(),
+        )
         (tmp_path / stored.id.hex).mkdir(parents=True, exist_ok=True)
         await service.save_meta()
 
@@ -3545,17 +3544,21 @@ class TestMutationsOwnedByConversationState:
 
     @pytest.mark.asyncio
     async def test_meta_json_excludes_security_analyzer(self, tmp_path):
-        """security_analyzer must not appear in meta.json."""
+        """security_analyzer must not appear in meta.json (it lives on EventService,
+        not StoredConversation, so it is structurally excluded from meta.json)."""
         from openhands.sdk.security.llm_analyzer import LLMSecurityAnalyzer
 
         stored = StoredConversation(
             id=uuid4(),
             workspace=LocalWorkspace(working_dir=str(tmp_path)),
-            security_analyzer=LLMSecurityAnalyzer(),
             initial_message=None,
             metrics=None,
         )
-        service = EventService(stored=stored, conversations_dir=tmp_path)
+        service = EventService(
+            stored=stored,
+            conversations_dir=tmp_path,
+            security_analyzer=LLMSecurityAnalyzer(),
+        )
         (tmp_path / stored.id.hex).mkdir(parents=True, exist_ok=True)
         await service.save_meta()
 
@@ -3564,17 +3567,21 @@ class TestMutationsOwnedByConversationState:
 
     @pytest.mark.asyncio
     async def test_meta_json_excludes_secrets(self, tmp_path):
-        """secrets must not appear in meta.json."""
+        """secrets must not appear in meta.json (they live on EventService,
+        not StoredConversation, so they are structurally excluded from meta.json)."""
         from openhands.sdk.secret.secrets import StaticSecret
 
         stored = StoredConversation(
             id=uuid4(),
             workspace=LocalWorkspace(working_dir=str(tmp_path)),
-            secrets={"MY_KEY": StaticSecret(value="hunter2")},
             initial_message=None,
             metrics=None,
         )
-        service = EventService(stored=stored, conversations_dir=tmp_path)
+        service = EventService(
+            stored=stored,
+            conversations_dir=tmp_path,
+            secrets={"MY_KEY": StaticSecret(value="hunter2")},
+        )
         (tmp_path / stored.id.hex).mkdir(parents=True, exist_ok=True)
         await service.save_meta()
 
@@ -3652,14 +3659,13 @@ class TestMutationsOwnedByConversationState:
     @pytest.mark.asyncio
     async def test_start_skips_policy_init_on_resume(self, tmp_path):
         """On resume (base_state.json exists), set_confirmation_policy must NOT
-        be called from stored — ConversationState already has the live value.
+        be called — ConversationState already has the live value.
         """
         from openhands.sdk.security.confirmation_policy import AlwaysConfirm
 
         stored = StoredConversation(
             id=uuid4(),
             workspace=LocalWorkspace(working_dir=str(tmp_path)),
-            confirmation_policy=AlwaysConfirm(),
             initial_message=None,
             metrics=None,
         )
@@ -3667,6 +3673,7 @@ class TestMutationsOwnedByConversationState:
             stored=stored,
             agent=_sample_agent(),
             conversations_dir=tmp_path,
+            confirmation_policy=AlwaysConfirm(),
         )
         mock_conv = _make_mock_conv()
 
@@ -3687,14 +3694,13 @@ class TestMutationsOwnedByConversationState:
     @pytest.mark.asyncio
     async def test_start_applies_policy_on_new_conversation(self, tmp_path):
         """On a new conversation (no base_state.json), the initial policy from
-        stored must be applied to ConversationState.
+        EventService.confirmation_policy must be applied to ConversationState.
         """
         from openhands.sdk.security.confirmation_policy import AlwaysConfirm
 
         stored = StoredConversation(
             id=uuid4(),
             workspace=LocalWorkspace(working_dir=str(tmp_path)),
-            confirmation_policy=AlwaysConfirm(),
             initial_message=None,
             metrics=None,
         )
@@ -3702,6 +3708,7 @@ class TestMutationsOwnedByConversationState:
             stored=stored,
             agent=_sample_agent(),
             conversations_dir=tmp_path,
+            confirmation_policy=AlwaysConfirm(),
         )
         mock_conv = _make_mock_conv()
 

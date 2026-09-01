@@ -241,7 +241,7 @@ async def test_start_conversation_registers_and_injects_client_tools(
             agent=agent,
             workspace=stored.workspace,
             execution_status=ConversationExecutionStatus.IDLE,
-            confirmation_policy=stored.confirmation_policy,
+            confirmation_policy=NeverConfirm(),
         )
         return service
 
@@ -320,7 +320,7 @@ async def test_start_conversation_decrypts_encrypted_agent_settings_mcp_env(
             agent=agent,
             workspace=stored.workspace,
             execution_status=ConversationExecutionStatus.IDLE,
-            confirmation_policy=stored.confirmation_policy,
+            confirmation_policy=NeverConfirm(),
         )
         return service
 
@@ -1041,7 +1041,7 @@ async def test_waiting_hydration_cannot_restore_deleted_conversation(
             agent=_sample_agent(),
             workspace=record.stored.workspace,
             execution_status=ConversationExecutionStatus.IDLE,
-            confirmation_policy=record.stored.confirmation_policy,
+            confirmation_policy=NeverConfirm(),
         )
         deleting_runtime = AsyncMock(spec=EventService)
         deleting_runtime.is_open.return_value = True
@@ -1107,7 +1107,7 @@ async def test_shutdown_closes_runtime_from_in_flight_hydration(
         agent=_sample_agent(),
         workspace=record.stored.workspace,
         execution_status=ConversationExecutionStatus.IDLE,
-        confirmation_policy=record.stored.confirmation_policy,
+        confirmation_policy=NeverConfirm(),
     )
     startup_entered = asyncio.Event()
     finish_startup = asyncio.Event()
@@ -1209,7 +1209,7 @@ class TestConversationServiceSearchConversations:
             agent=_sample_agent(),
             workspace=sample_stored_conversation.workspace,
             execution_status=ConversationExecutionStatus.IDLE,
-            confirmation_policy=sample_stored_conversation.confirmation_policy,
+            confirmation_policy=NeverConfirm(),
         )
         mock_service.get_state.return_value = mock_state
 
@@ -1254,7 +1254,7 @@ class TestConversationServiceSearchConversations:
             agent=agent,
             workspace=stored_conv.workspace,
             execution_status=ConversationExecutionStatus.IDLE,
-            confirmation_policy=stored_conv.confirmation_policy,
+            confirmation_policy=NeverConfirm(),
         )
         conversation_service._event_services[stored_conv.id] = mock_service
 
@@ -1300,7 +1300,7 @@ class TestConversationServiceSearchConversations:
                 agent=_sample_agent(),
                 workspace=stored_conv.workspace,
                 execution_status=status,
-                confirmation_policy=stored_conv.confirmation_policy,
+                confirmation_policy=NeverConfirm(),
             )
             mock_service.get_state.return_value = mock_state
 
@@ -1353,7 +1353,7 @@ class TestConversationServiceSearchConversations:
                 agent=_sample_agent(),
                 workspace=stored_conv.workspace,
                 execution_status=ConversationExecutionStatus.IDLE,
-                confirmation_policy=stored_conv.confirmation_policy,
+                confirmation_policy=NeverConfirm(),
             )
             mock_service.get_state.return_value = mock_state
 
@@ -1427,7 +1427,7 @@ class TestConversationServiceSearchConversations:
                 agent=_sample_agent(),
                 workspace=stored_conv.workspace,
                 execution_status=ConversationExecutionStatus.IDLE,
-                confirmation_policy=stored_conv.confirmation_policy,
+                confirmation_policy=NeverConfirm(),
             )
             mock_service.get_state.return_value = mock_state
 
@@ -1496,7 +1496,7 @@ class TestConversationServiceSearchConversations:
                 agent=_sample_agent(),
                 workspace=stored_conv.workspace,
                 execution_status=status,
-                confirmation_policy=stored_conv.confirmation_policy,
+                confirmation_policy=NeverConfirm(),
             )
             mock_service.get_state.return_value = mock_state
 
@@ -1524,7 +1524,7 @@ class TestConversationServiceSearchConversations:
             agent=_sample_agent(),
             workspace=sample_stored_conversation.workspace,
             execution_status=ConversationExecutionStatus.IDLE,
-            confirmation_policy=sample_stored_conversation.confirmation_policy,
+            confirmation_policy=NeverConfirm(),
         )
         mock_service.get_state.return_value = mock_state
 
@@ -1573,7 +1573,7 @@ class TestConversationServiceCountConversations:
             agent=_sample_agent(),
             workspace=sample_stored_conversation.workspace,
             execution_status=ConversationExecutionStatus.IDLE,
-            confirmation_policy=sample_stored_conversation.confirmation_policy,
+            confirmation_policy=NeverConfirm(),
         )
         mock_service.get_state.return_value = mock_state
 
@@ -1612,7 +1612,7 @@ class TestConversationServiceCountConversations:
                 agent=_sample_agent(),
                 workspace=stored_conv.workspace,
                 execution_status=status,
-                confirmation_policy=stored_conv.confirmation_policy,
+                confirmation_policy=NeverConfirm(),
             )
             mock_service.get_state.return_value = mock_state
 
@@ -1671,7 +1671,7 @@ class TestConversationServiceCountConversations:
                 agent=_sample_agent(),
                 workspace=stored_conv.workspace,
                 execution_status=ConversationExecutionStatus.IDLE,
-                confirmation_policy=stored_conv.confirmation_policy,
+                confirmation_policy=NeverConfirm(),
             )
             conversation_service._event_services[stored_conv.id] = mock_service
 
@@ -1717,9 +1717,20 @@ class TestConversationServiceStartConversation:
                     confirmation_policy=request.confirmation_policy,
                 )
                 mock_event_service.get_state.return_value = mock_state
+                _init_only = {
+                    "agent", "agent_settings", "agent_profile_id",
+                    "secrets", "secrets_encrypted",
+                    "confirmation_policy", "security_analyzer",
+                }
                 mock_event_service.stored = StoredConversation(
                     id=mock_state.id,
-                    **request.model_dump(mode="json", context={"expose_secrets": True}),
+                    **{
+                        k: v
+                        for k, v in request.model_dump(
+                            mode="json", context={"expose_secrets": True}
+                        ).items()
+                        if k not in _init_only
+                    },
                     created_at=datetime.now(UTC),
                     updated_at=datetime.now(UTC),
                 )
@@ -1730,18 +1741,19 @@ class TestConversationServiceStartConversation:
                 # Verify EventService was created with the correct parameters
                 mock_event_service_class.assert_called_once()
                 call_args = mock_event_service_class.call_args
-                stored_conversation = call_args.kwargs["stored"]
+                # secrets are passed directly to EventService, not via StoredConversation
+                event_service_secrets = call_args.kwargs["secrets"]
 
-                # Verify that secrets were passed to the stored conversation
-                assert stored_conversation.secrets == test_secrets
-                assert "api_key" in stored_conversation.secrets
-                assert "database_url" in stored_conversation.secrets
+                # Verify that secrets were passed to EventService
+                assert event_service_secrets == test_secrets
+                assert "api_key" in event_service_secrets
+                assert "database_url" in event_service_secrets
                 assert (
-                    stored_conversation.secrets["api_key"].get_value()
+                    event_service_secrets["api_key"].get_value()
                     == "secret-api-key-123"
                 )
                 assert (
-                    stored_conversation.secrets["database_url"].get_value()
+                    event_service_secrets["database_url"].get_value()
                     == "postgresql://user:pass@host:5432/db"
                 )
 
@@ -1779,9 +1791,20 @@ class TestConversationServiceStartConversation:
                     confirmation_policy=request.confirmation_policy,
                 )
                 mock_event_service.get_state.return_value = mock_state
+                _init_only = {
+                    "agent", "agent_settings", "agent_profile_id",
+                    "secrets", "secrets_encrypted",
+                    "confirmation_policy", "security_analyzer",
+                }
                 mock_event_service.stored = StoredConversation(
                     id=mock_state.id,
-                    **request.model_dump(mode="json", context={"expose_secrets": True}),
+                    **{
+                        k: v
+                        for k, v in request.model_dump(
+                            mode="json", context={"expose_secrets": True}
+                        ).items()
+                        if k not in _init_only
+                    },
                     created_at=datetime.now(UTC),
                     updated_at=datetime.now(UTC),
                 )
@@ -1792,10 +1815,11 @@ class TestConversationServiceStartConversation:
                 # Verify EventService was created with the correct parameters
                 mock_event_service_class.assert_called_once()
                 call_args = mock_event_service_class.call_args
-                stored_conversation = call_args.kwargs["stored"]
+                # secrets are passed directly to EventService, not via StoredConversation
+                event_service_secrets = call_args.kwargs["secrets"]
 
                 # Verify that secrets is an empty dict (default)
-                assert stored_conversation.secrets == {}
+                assert event_service_secrets == {}
 
                 # Verify the conversation was started
                 mock_event_service.start.assert_called_once()
@@ -1834,7 +1858,7 @@ class TestConversationServiceStartConversation:
                 agent=agent or _sample_agent(),
                 workspace=stored.workspace,
                 execution_status=ConversationExecutionStatus.IDLE,
-                confirmation_policy=stored.confirmation_policy,
+                confirmation_policy=NeverConfirm(),
             )
             return mock_event_service
 
@@ -1901,7 +1925,7 @@ class TestConversationServiceStartConversation:
                 agent=agent or _sample_agent(),
                 workspace=stored.workspace,
                 execution_status=ConversationExecutionStatus.IDLE,
-                confirmation_policy=stored.confirmation_policy,
+                confirmation_policy=NeverConfirm(),
             )
             return mock_event_service
 
@@ -1952,7 +1976,7 @@ class TestConversationServiceStartConversation:
                 agent=agent or _sample_agent(),
                 workspace=stored.workspace,
                 execution_status=ConversationExecutionStatus.IDLE,
-                confirmation_policy=stored.confirmation_policy,
+                confirmation_policy=NeverConfirm(),
             )
             return mock_event_service
 
@@ -2210,7 +2234,7 @@ class TestConversationServiceStartConversation:
             agent=_sample_agent(),
             workspace=mock_event_service.stored.workspace,
             execution_status=ConversationExecutionStatus.IDLE,
-            confirmation_policy=mock_event_service.stored.confirmation_policy,
+            confirmation_policy=NeverConfirm(),
         )
         mock_event_service.get_state.return_value = mock_state
         conversation_service._event_services[custom_id] = mock_event_service
@@ -2260,7 +2284,7 @@ class TestConversationServiceStartConversation:
             agent=acp_agent,
             workspace=stored.workspace,
             execution_status=ConversationExecutionStatus.IDLE,
-            confirmation_policy=stored.confirmation_policy,
+            confirmation_policy=NeverConfirm(),
         )
         conversation_service._event_services[custom_id] = mock_event_service
 
@@ -2379,7 +2403,7 @@ class TestConversationServiceUpdateConversation:
             agent=_sample_agent(),
             workspace=sample_stored_conversation.workspace,
             execution_status=ConversationExecutionStatus.IDLE,
-            confirmation_policy=sample_stored_conversation.confirmation_policy,
+            confirmation_policy=NeverConfirm(),
         )
         mock_service.get_state.return_value = mock_state
 
@@ -2410,7 +2434,7 @@ class TestConversationServiceUpdateConversation:
             agent=_sample_agent(),
             workspace=sample_stored_conversation.workspace,
             execution_status=ConversationExecutionStatus.IDLE,
-            confirmation_policy=sample_stored_conversation.confirmation_policy,
+            confirmation_policy=NeverConfirm(),
         )
         mock_service.get_state.return_value = mock_state
 
@@ -2441,7 +2465,7 @@ class TestConversationServiceUpdateConversation:
             agent=_sample_agent(),
             workspace=sample_stored_conversation.workspace,
             execution_status=ConversationExecutionStatus.IDLE,
-            confirmation_policy=sample_stored_conversation.confirmation_policy,
+            confirmation_policy=NeverConfirm(),
         )
         acquire_spy = MagicMock(wraps=mock_state._lock.acquire)
         release_spy = MagicMock(wraps=mock_state._lock.release)
@@ -2475,7 +2499,7 @@ class TestConversationServiceUpdateConversation:
             agent=_sample_agent(),
             workspace=sample_stored_conversation.workspace,
             execution_status=ConversationExecutionStatus.IDLE,
-            confirmation_policy=sample_stored_conversation.confirmation_policy,
+            confirmation_policy=NeverConfirm(),
         )
         mock_service.get_state.return_value = state
 
@@ -2562,7 +2586,7 @@ class TestConversationServiceUpdateConversation:
             agent=_sample_agent(),
             workspace=sample_stored_conversation.workspace,
             execution_status=ConversationExecutionStatus.IDLE,
-            confirmation_policy=sample_stored_conversation.confirmation_policy,
+            confirmation_policy=NeverConfirm(),
         )
         mock_service.get_state.return_value = mock_state
 
@@ -2609,7 +2633,7 @@ class TestConversationServiceUpdateConversation:
             agent=acp_agent,
             workspace=stored_conversation.workspace,
             execution_status=ConversationExecutionStatus.IDLE,
-            confirmation_policy=stored_conversation.confirmation_policy,
+            confirmation_policy=NeverConfirm(),
         )
         mock_service.get_state.return_value = mock_state
 
@@ -2641,7 +2665,7 @@ class TestConversationServiceUpdateConversation:
             agent=_sample_agent(),
             workspace=sample_stored_conversation.workspace,
             execution_status=ConversationExecutionStatus.IDLE,
-            confirmation_policy=sample_stored_conversation.confirmation_policy,
+            confirmation_policy=NeverConfirm(),
         )
         mock_service.get_state.return_value = mock_state
 
@@ -2673,7 +2697,7 @@ class TestConversationServiceUpdateConversation:
             agent=_sample_agent(),
             workspace=sample_stored_conversation.workspace,
             execution_status=ConversationExecutionStatus.IDLE,
-            confirmation_policy=sample_stored_conversation.confirmation_policy,
+            confirmation_policy=NeverConfirm(),
         )
         mock_service.get_state.return_value = mock_state
 
@@ -2724,7 +2748,7 @@ class TestConversationServiceUpdateConversation:
             agent=_sample_agent(),
             workspace=sample_stored_conversation.workspace,
             execution_status=ConversationExecutionStatus.IDLE,
-            confirmation_policy=sample_stored_conversation.confirmation_policy,
+            confirmation_policy=NeverConfirm(),
         )
         mock_service.get_state.return_value = mock_state
 
@@ -2794,7 +2818,7 @@ class TestConversationServiceDeleteConversation:
             agent=_sample_agent(),
             workspace=mock_service.stored.workspace,
             execution_status=ConversationExecutionStatus.IDLE,
-            confirmation_policy=mock_service.stored.confirmation_policy,
+            confirmation_policy=NeverConfirm(),
         )
         mock_service.get_state.return_value = mock_state
 
@@ -2840,7 +2864,7 @@ class TestConversationServiceDeleteConversation:
             agent=_sample_agent(),
             workspace=sample_stored_conversation.workspace,
             execution_status=ConversationExecutionStatus.IDLE,
-            confirmation_policy=sample_stored_conversation.confirmation_policy,
+            confirmation_policy=NeverConfirm(),
         )
         mock_service.get_state.return_value = mock_state
 
@@ -2945,7 +2969,7 @@ class TestConversationServiceDeleteConversation:
             agent=_sample_agent(),
             workspace=mock_service.stored.workspace,
             execution_status=ConversationExecutionStatus.IDLE,
-            confirmation_policy=mock_service.stored.confirmation_policy,
+            confirmation_policy=NeverConfirm(),
         )
         mock_service.get_state.return_value = mock_state
 
@@ -2989,7 +3013,7 @@ class TestConversationServiceDeleteConversation:
             agent=_sample_agent(),
             workspace=mock_service.stored.workspace,
             execution_status=ConversationExecutionStatus.IDLE,
-            confirmation_policy=mock_service.stored.confirmation_policy,
+            confirmation_policy=NeverConfirm(),
         )
         mock_service.close.side_effect = CredentialSyncError("broker unavailable")
         binding = MagicMock()
@@ -3039,7 +3063,7 @@ class TestConversationServiceDeleteConversation:
             agent=_sample_agent(),
             workspace=mock_service.stored.workspace,
             execution_status=ConversationExecutionStatus.IDLE,
-            confirmation_policy=mock_service.stored.confirmation_policy,
+            confirmation_policy=NeverConfirm(),
         )
         mock_service.get_state.return_value = mock_state
 
