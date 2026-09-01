@@ -2693,8 +2693,12 @@ class LocalConversation(BaseConversation):
                      SecretValue = str | Callable[[], str]. Callables are invoked lazily
                      when a command references the secret key.
         """
-        secret_registry = self._state.secret_registry
-        secret_registry.update_secrets(secrets)
+        with self._state:
+            registry = self._state.secret_registry.model_copy(
+                update={"secret_sources": dict(self._state.secret_registry.secret_sources)}
+            )
+            registry.update_secrets(secrets)
+            self._state.secret_registry = registry
         logger.info(f"Added {len(secrets)} secrets to conversation")
 
     def set_security_analyzer(self, analyzer: SecurityAnalyzerBase | None) -> None:

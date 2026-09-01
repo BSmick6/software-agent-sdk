@@ -3507,3 +3507,212 @@ async def test_event_service_creates_lease_with_custom_ttl(tmp_path: Path) -> No
     assert service._lease is not None
     assert service._lease._ttl_seconds == 10.0
     assert (tmp_path / stored.id.hex / LEASE_FILE_NAME).exists()
+
+
+class TestMutationsOwnedByConversationState:
+    """Verify that confirmation_policy, security_analyzer, and secrets are
+    owned by ConversationState/base_state.json, not StoredConversation/meta.json.
+
+    The acceptance criteria from issue #4810:
+    - These fields must NOT be stored in meta.json (excluded from StoredConversation)
+    - Mutations via API must reach ConversationState so they autosave to base_state.json
+    - On resume, the live values from ConversationState are used; stale values from
+      StoredConversation/meta.json must not silently overwrite them
+    """
+
+    # -------------------------------------------------------------------------
+    # meta.json exclusion
+    # -------------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_meta_json_excludes_confirmation_policy(self, tmp_path):
+        """confirmation_policy must not appear in meta.json."""
+        from openhands.sdk.security.confirmation_policy import AlwaysConfirm
+
+        stored = StoredConversation(
+            id=uuid4(),
+            workspace=LocalWorkspace(working_dir=str(tmp_path)),
+            confirmation_policy=AlwaysConfirm(),
+            initial_message=None,
+            metrics=None,
+        )
+        service = EventService(stored=stored, conversations_dir=tmp_path)
+        (tmp_path / stored.id.hex).mkdir(parents=True, exist_ok=True)
+        await service.save_meta()
+
+        payload = json.loads((tmp_path / stored.id.hex / "meta.json").read_text())
+        assert "confirmation_policy" not in payload
+
+    @pytest.mark.asyncio
+    async def test_meta_json_excludes_security_analyzer(self, tmp_path):
+        """security_analyzer must not appear in meta.json."""
+        from openhands.sdk.security.llm_analyzer import LLMSecurityAnalyzer
+
+        stored = StoredConversation(
+            id=uuid4(),
+            workspace=LocalWorkspace(working_dir=str(tmp_path)),
+            security_analyzer=LLMSecurityAnalyzer(),
+            initial_message=None,
+            metrics=None,
+        )
+        service = EventService(stored=stored, conversations_dir=tmp_path)
+        (tmp_path / stored.id.hex).mkdir(parents=True, exist_ok=True)
+        await service.save_meta()
+
+        payload = json.loads((tmp_path / stored.id.hex / "meta.json").read_text())
+        assert "security_analyzer" not in payload
+
+    @pytest.mark.asyncio
+    async def test_meta_json_excludes_secrets(self, tmp_path):
+        """secrets must not appear in meta.json."""
+        from openhands.sdk.secret.secrets import StaticSecret
+
+        stored = StoredConversation(
+            id=uuid4(),
+            workspace=LocalWorkspace(working_dir=str(tmp_path)),
+            secrets={"MY_KEY": StaticSecret(value="hunter2")},
+            initial_message=None,
+            metrics=None,
+        )
+        service = EventService(stored=stored, conversations_dir=tmp_path)
+        (tmp_path / stored.id.hex).mkdir(parents=True, exist_ok=True)
+        await service.save_meta()
+
+        payload = json.loads((tmp_path / stored.id.hex / "meta.json").read_text())
+        assert "secrets" not in payload
+
+    # -------------------------------------------------------------------------
+    # Mutations delegate to ConversationState (autosaved to base_state.json)
+    # -------------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_set_confirmation_policy_delegates_to_conversation(self, tmp_path):
+        """set_confirmation_policy must delegate to the SDK conversation."""
+        from openhands.sdk.security.confirmation_policy import AlwaysConfirm
+
+        stored = StoredConversation(
+            id=uuid4(),
+            workspace=LocalWorkspace(working_dir=str(tmp_path)),
+            initial_message=None,
+            metrics=None,
+        )
+        service = EventService(stored=stored, conversations_dir=tmp_path)
+        mock_conv = MagicMock()
+        service._conversation = mock_conv
+
+        await service.set_confirmation_policy(AlwaysConfirm())
+
+        mock_conv.set_confirmation_policy.assert_called_once()
+        assert isinstance(mock_conv.set_confirmation_policy.call_args[0][0], AlwaysConfirm)
+
+    @pytest.mark.asyncio
+    async def test_set_security_analyzer_delegates_to_conversation(self, tmp_path):
+        """set_security_analyzer must delegate to the SDK conversation."""
+        from openhands.sdk.security.llm_analyzer import LLMSecurityAnalyzer
+
+        stored = StoredConversation(
+            id=uuid4(),
+            workspace=LocalWorkspace(working_dir=str(tmp_path)),
+            initial_message=None,
+            metrics=None,
+        )
+        service = EventService(stored=stored, conversations_dir=tmp_path)
+        mock_conv = MagicMock()
+        service._conversation = mock_conv
+
+        analyzer = LLMSecurityAnalyzer()
+        await service.set_security_analyzer(analyzer)
+
+        mock_conv.set_security_analyzer.assert_called_once_with(analyzer)
+
+    @pytest.mark.asyncio
+    async def test_update_secrets_delegates_to_conversation(self, tmp_path):
+        """update_secrets must delegate to the SDK conversation."""
+        from openhands.sdk.secret.secrets import StaticSecret
+
+        stored = StoredConversation(
+            id=uuid4(),
+            workspace=LocalWorkspace(working_dir=str(tmp_path)),
+            initial_message=None,
+            metrics=None,
+        )
+        service = EventService(stored=stored, conversations_dir=tmp_path)
+        mock_conv = MagicMock()
+        service._conversation = mock_conv
+
+        secret = StaticSecret(value="hunter2")
+        await service.update_secrets({"MY_KEY": secret})
+
+        mock_conv.update_secrets.assert_called_once_with({"MY_KEY": secret})
+
+    # -------------------------------------------------------------------------
+    # Resume does not overwrite ConversationState with stale stored values
+    # -------------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_start_skips_policy_init_on_resume(self, tmp_path):
+        """On resume (base_state.json exists), set_confirmation_policy must NOT
+        be called from stored — ConversationState already has the live value.
+        """
+        from openhands.sdk.security.confirmation_policy import AlwaysConfirm
+
+        stored = StoredConversation(
+            id=uuid4(),
+            workspace=LocalWorkspace(working_dir=str(tmp_path)),
+            confirmation_policy=AlwaysConfirm(),
+            initial_message=None,
+            metrics=None,
+        )
+        service = EventService(
+            stored=stored,
+            agent=_sample_agent(),
+            conversations_dir=tmp_path,
+        )
+        mock_conv = _make_mock_conv()
+
+        # Simulate a pre-existing base_state.json so start() takes the resume path.
+        conv_dir = tmp_path / stored.id.hex
+        conv_dir.mkdir(parents=True, exist_ok=True)
+        (conv_dir / "base_state.json").write_text("{}")
+
+        with patch(
+            "openhands.agent_server.event_service.LocalConversation",
+            return_value=mock_conv,
+        ):
+            await service.start()
+
+        mock_conv.set_confirmation_policy.assert_not_called()
+        mock_conv.set_security_analyzer.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_start_applies_policy_on_new_conversation(self, tmp_path):
+        """On a new conversation (no base_state.json), the initial policy from
+        stored must be applied to ConversationState.
+        """
+        from openhands.sdk.security.confirmation_policy import AlwaysConfirm
+
+        stored = StoredConversation(
+            id=uuid4(),
+            workspace=LocalWorkspace(working_dir=str(tmp_path)),
+            confirmation_policy=AlwaysConfirm(),
+            initial_message=None,
+            metrics=None,
+        )
+        service = EventService(
+            stored=stored,
+            agent=_sample_agent(),
+            conversations_dir=tmp_path,
+        )
+        mock_conv = _make_mock_conv()
+
+        # No base_state.json → new conversation path.
+        (tmp_path / stored.id.hex).mkdir(parents=True, exist_ok=True)
+
+        with patch(
+            "openhands.agent_server.event_service.LocalConversation",
+            return_value=mock_conv,
+        ):
+            await service.start()
+
+        mock_conv.set_confirmation_policy.assert_called_once()
+        assert isinstance(mock_conv.set_confirmation_policy.call_args[0][0], AlwaysConfirm)

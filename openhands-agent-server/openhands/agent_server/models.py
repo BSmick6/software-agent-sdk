@@ -83,7 +83,24 @@ class StoredConversation(ConversationConfig):
     ``ConversationState`` persisted to ``base_state.json``. Because
     ``StoredConversation`` is not a ``StartConversationRequest``, the agent
     cannot silently re-appear in ``meta.json``.
+
+    The fields below are inherited from ``ConversationConfig`` for use at
+    creation time (to seed ``ConversationState``) but are excluded from
+    ``meta.json`` serialization.  Their authoritative post-creation storage is
+    ``ConversationState`` / ``base_state.json``, where mutations applied via
+    the API are automatically persisted.  Persisting them here too would cause
+    stale values to silently overwrite the live state on eviction / restart.
     """
+
+    # Excluded from meta.json — owned by ConversationState/base_state.json.
+    secrets: dict[str, SecretSource] = Field(default_factory=dict, exclude=True)
+    secrets_encrypted: bool = Field(default=False, exclude=True)
+    confirmation_policy: ConfirmationPolicyBase = Field(
+        default=NeverConfirm(), exclude=True
+    )
+    security_analyzer: SecurityAnalyzerBase | None = Field(
+        default=None, exclude=True
+    )
 
     required_runtime_credential_bindings: set[str] = Field(default_factory=set)
 

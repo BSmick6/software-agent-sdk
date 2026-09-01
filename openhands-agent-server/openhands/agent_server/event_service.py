@@ -190,8 +190,11 @@ class EventService:
             )
 
     def _without_stored_secret(self, secret_name: str) -> StoredConversation:
-        # meta.json (StoredConversation) no longer carries the agent, so there is
-        # no agent_context secret to scrub here — only the stored secrets map.
+        # StoredConversation.secrets is excluded from meta.json serialization;
+        # it exists only in-memory for ephemeral credential injection (e.g.
+        # CODEX_AUTH_SECRET_NAME) before event_service start.  Scrubbing it
+        # here removes the secret from the in-memory copy so it is not passed
+        # to LocalConversation if the service is restarted.
         # The agent's own secret scrub happens on base_state.json (see
         # _scrub_persisted_credentials).
         secrets = dict(self.stored.secrets)
@@ -353,10 +356,6 @@ class EventService:
                     agent.restart_for_updated_credentials(secrets)
 
         await asyncio.to_thread(_update)
-        self.stored = self.stored.model_copy(
-            update={"secrets": {**self.stored.secrets, **secrets}}
-        )
-        await self.save_meta()
 
     def _write_guard(self):
         if self._lease is None or self._lease_generation is None:
@@ -1113,8 +1112,9 @@ class EventService:
             mcp_tool_provider=self.mcp_tool_provider,
         )
 
-        conversation.set_confirmation_policy(self.stored.confirmation_policy)
-        conversation.set_security_analyzer(self.stored.security_analyzer)
+        if not base_state_exists:
+            conversation.set_confirmation_policy(self.stored.confirmation_policy)
+            conversation.set_security_analyzer(self.stored.security_analyzer)
         # On resume the agent was unknown at construction time (loaded from
         # base_state.json), so decide token streaming now and disable it when the
         # resolved agent can't emit token callbacks.
