@@ -227,7 +227,7 @@ def test_get_conversation_includes_tags(
 
 
 def test_set_conversation_tag(client, mock_conversation_service):
-    """POST /tags/{key} sets a single tag without touching others."""
+    """PUT /tags/{key} sets a single tag without touching others."""
     mock_conversation_service.set_conversation_tag = AsyncMock(return_value=True)
     client.app.dependency_overrides[get_conversation_service] = (
         lambda: mock_conversation_service
@@ -249,7 +249,7 @@ def test_set_conversation_tag(client, mock_conversation_service):
 
 
 def test_set_conversation_tag_missing_conversation(client, mock_conversation_service):
-    """POST /tags/{key} returns 404 when the conversation does not exist."""
+    """PUT /tags/{key} returns 404 when the conversation does not exist."""
     mock_conversation_service.set_conversation_tag = AsyncMock(return_value=False)
     client.app.dependency_overrides[get_conversation_service] = (
         lambda: mock_conversation_service
@@ -267,7 +267,7 @@ def test_set_conversation_tag_missing_conversation(client, mock_conversation_ser
 
 
 def test_set_conversation_tag_invalid_key(client, mock_conversation_service):
-    """POST /tags/{key} returns 422 for an invalid tag key."""
+    """PUT /tags/{key} returns 422 for an invalid tag key."""
     client.app.dependency_overrides[get_conversation_service] = (
         lambda: mock_conversation_service
     )
@@ -281,6 +281,21 @@ def test_set_conversation_tag_invalid_key(client, mock_conversation_service):
         assert response.status_code == 422
     finally:
         client.app.dependency_overrides.clear()
+
+
+def test_validate_tags_rejects_newline_in_key():
+    """_validate_tags must use fullmatch so a trailing newline does not slip through.
+
+    re.match(r'^[a-z0-9]+$', 'abc\\n') returns a match because $ matches before
+    a trailing newline; re.fullmatch does not.  This test pins that behaviour so
+    reverting fullmatch to match would be caught immediately.
+    """
+    import pytest as _pytest
+
+    from openhands.sdk.conversation.types import _validate_tags
+
+    with _pytest.raises(ValueError, match="invalid"):
+        _validate_tags({"abc\n": "value"})
 
 
 def test_delete_conversation_tag(client, mock_conversation_service):
@@ -359,7 +374,7 @@ def test_delete_conversation_tag_missing_key(client, mock_conversation_service):
 
 
 def test_set_tag_does_not_affect_other_tags(client, mock_conversation_service):
-    """POST /tags/{key} overwrites only the specified key."""
+    """PUT /tags/{key} overwrites only the specified key."""
     mock_conversation_service.set_conversation_tag = AsyncMock(return_value=True)
     client.app.dependency_overrides[get_conversation_service] = (
         lambda: mock_conversation_service
