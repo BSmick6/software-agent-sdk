@@ -762,7 +762,6 @@ class LocalConversation(BaseConversation):
         *,
         conversation_id: ConversationID | None = None,
         agent: AgentBase | None = None,
-        title: str | None = None,
         tags: dict[str, str] | None = None,
         reset_metrics: bool = True,
         from_event_id: EventID | None = None,
@@ -778,7 +777,6 @@ class LocalConversation(BaseConversation):
                 if ``None``).
             agent: Agent for the fork. Defaults to a deep-copy of the
                 source agent.
-            title: Optional title for the forked conversation.
             tags: Optional tags for the forked conversation.
             reset_metrics: If ``True`` (default), cost/token stats start
                 fresh on the fork.
@@ -872,13 +870,6 @@ class LocalConversation(BaseConversation):
                 self._state.activated_path_rules
             )
             fork_conv._state.agent_state = copy.deepcopy(self._state.agent_state)
-
-            # Copy title via tags if provided
-            if title is not None:
-                fork_conv._state.tags = {
-                    **fork_conv._state.tags,
-                    "title": title,
-                }
 
             # Reset or copy metrics
             if not reset_metrics:

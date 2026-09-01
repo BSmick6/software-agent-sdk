@@ -221,13 +221,6 @@ def test_fork_with_tags():
         assert fork.state.tags.get("env") == "test"
 
 
-def test_fork_with_title_sets_tag():
-    """Title is stored as a 'title' tag."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        src = Conversation(agent=_agent(), persistence_dir=tmpdir, workspace=tmpdir)
-        fork = src.fork(title="My Fork")
-
-        assert fork.state.tags.get("title") == "My Fork"
 
 
 def test_fork_shares_workspace():
