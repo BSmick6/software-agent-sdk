@@ -263,6 +263,12 @@ class StartConversationRequest(ConversationConfig):
     / ``base_state.json``.  These fields live here (not on ``ConversationConfig``)
     so the persisted record (``StoredConversation``) cannot carry them by
     construction — avoiding the two-source-of-truth problem that existed before.
+
+    Supports any concrete :class:`AgentBase` implementation, including regular
+    OpenHands agents and ACP agents.  Clients may supply a concrete ``agent``
+    payload, an ``agent_settings`` payload (validated with the ``agent_kind``
+    discriminator and converted to the appropriate agent type), or an
+    ``agent_profile_id`` (resolved server-side from the profile store).
     """
 
     # Init-only fields: seeded into ConversationState on first start and never
