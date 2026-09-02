@@ -197,12 +197,6 @@ class EventService:
                 )
             )
 
-    def _remove_initial_secret(self, secret_name: str) -> None:
-        # self.secrets is init-only and never persisted to meta.json; scrubbing
-        # it here ensures the secret is not passed to LocalConversation if the
-        # service restarts before start() has run.  The agent's secret scrub
-        # happens on base_state.json (see _scrub_persisted_credentials).
-        self.secrets.pop(secret_name, None)
 
     async def _scrub_persisted_credentials(
         self,
@@ -244,7 +238,7 @@ class EventService:
                     "ChatGPT authentication is invalid. Please sign in again."
                 )
         for secret_name in bindings:
-            self._remove_initial_secret(secret_name)
+            self.secrets.pop(secret_name, None)
 
         if (
             not base_state_file.exists()
@@ -326,7 +320,7 @@ class EventService:
             )
             state.agent = agent
             conversation.agent = agent
-            self._remove_initial_secret(secret_name)
+            self.secrets.pop(secret_name, None)
         await self._scrub_persisted_credentials()
 
     async def apply_resume_secrets(
