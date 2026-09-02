@@ -1514,11 +1514,10 @@ class ConversationService:
                     )
                     # Pass the CODEX secret directly to the EventService instead
                     # of mutating stored (StoredConversation no longer carries secrets).
-                    injected_secrets: dict[str, SecretSource] | None = (
-                        {CODEX_AUTH_SECRET_NAME: fallback_secret}
-                        if injected_fallback
-                        else None
-                    )
+                    injected_secrets: dict[str, SecretSource] | None = None
+                    if injected_fallback:
+                        assert fallback_secret is not None
+                        injected_secrets = {CODEX_AUTH_SECRET_NAME: fallback_secret}
                     # Reuse the agent we already parsed from base_state.json
                     # above so the load path doesn't read and parse it again.
                     event_service = await self._get_or_load_event_service_locked(
