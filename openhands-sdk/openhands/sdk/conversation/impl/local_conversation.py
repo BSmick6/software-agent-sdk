@@ -4,6 +4,7 @@ import contextlib
 import copy
 import json
 import uuid
+import warnings
 from collections.abc import Mapping, Sequence
 from pathlib import Path, PurePath
 from typing import Any, Final, TypeGuard, cast
@@ -762,6 +763,7 @@ class LocalConversation(BaseConversation):
         *,
         conversation_id: ConversationID | None = None,
         agent: AgentBase | None = None,
+        title: str | None = None,
         tags: dict[str, str] | None = None,
         reset_metrics: bool = True,
         from_event_id: EventID | None = None,
@@ -777,6 +779,10 @@ class LocalConversation(BaseConversation):
                 if ``None``).
             agent: Agent for the fork. Defaults to a deep-copy of the
                 source agent.
+            title: Deprecated. ``LocalConversation`` has no title field;
+                ``ConversationState`` does not store titles (they live on
+                ``StoredConversation`` in the agent-server layer). Passing a
+                value is accepted for backwards compatibility but has no effect.
             tags: Optional tags for the forked conversation.
             reset_metrics: If ``True`` (default), cost/token stats start
                 fresh on the fork.
@@ -791,6 +797,14 @@ class LocalConversation(BaseConversation):
         Raises:
             ValueError: If ``from_event_id`` is not an event in this conversation.
         """
+        if title is not None:
+            warnings.warn(
+                "The 'title' parameter of LocalConversation.fork() is deprecated and "
+                "has no effect. LocalConversation has no title field; titles are "
+                "managed by StoredConversation in the agent-server layer.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         fork_id = conversation_id or uuid.uuid4()
         # Always deep-copy the agent (supplied or source) so the fork owns
         # its own object graph. Required because __init__ binds
