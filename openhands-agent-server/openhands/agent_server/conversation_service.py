@@ -2336,23 +2336,18 @@ class ConversationService:
         credential_bindings = await self._resolve_credential_bindings(
             stored, agent=agent
         )
-        event_service_kwargs: dict[str, Any] = {}
-        if confirmation_policy is not None:
-            event_service_kwargs["confirmation_policy"] = confirmation_policy
-        if security_analyzer is not None:
-            event_service_kwargs["security_analyzer"] = security_analyzer
-        if secrets is not None:
-            event_service_kwargs["secrets"] = secrets
         event_service = EventService(
             stored=stored,
             conversations_dir=self.conversations_dir,
             agent=agent,
+            confirmation_policy=confirmation_policy or NeverConfirm(),
+            security_analyzer=security_analyzer,
+            secrets=secrets or {},
             cipher=self.cipher,
             mcp_tool_provider=self.mcp_tool_provider,
             credential_bindings=credential_bindings,
             owner_instance_id=self.owner_instance_id,
             lease_ttl_seconds=self.lease_ttl_seconds,
-            **event_service_kwargs,
         )
         # Lease renewal is handled by the centralized
         # _renew_all_leases_loop task on ConversationService.
