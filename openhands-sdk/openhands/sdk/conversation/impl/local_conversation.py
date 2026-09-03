@@ -808,7 +808,7 @@ class LocalConversation(BaseConversation):
             warn_deprecated(
                 "LocalConversation.fork() title parameter",
                 deprecated_in="1.44.1",
-                removed_in="1.47.0",
+                removed_in="1.50.0",
                 details=(
                     "LocalConversation has no title field; titles are managed by "
                     "StoredConversation in the agent-server layer."
