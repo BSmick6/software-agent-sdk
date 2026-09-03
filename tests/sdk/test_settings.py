@@ -1390,6 +1390,7 @@ def test_acp_create_agent_uses_server_default_command(
     assert agent.acp_command == [
         "npx",
         "-y",
+        "--prefer-offline",
         "@agentclientprotocol/claude-agent-acp@0.63.0",
     ]
     assert agent.acp_model == "claude-opus-4-6"
@@ -1568,6 +1569,7 @@ def test_acp_resolve_command_keeps_npx_when_binary_absent(
     assert settings.resolve_acp_command() == [
         "npx",
         "-y",
+        "--prefer-offline",
         "@agentclientprotocol/codex-acp@1.1.7",
     ]
 
@@ -2380,7 +2382,7 @@ def test_llm_from_persisted_rebuilds_serialized_subscription_runtime(
     )
 
     source = OpenAISubscriptionAuth().create_llm(
-        model="gpt-5.6",
+        model="gpt-5.6-sol",
         credentials=credentials,
     )
     persisted = source.to_persisted()
@@ -2391,7 +2393,7 @@ def test_llm_from_persisted_rebuilds_serialized_subscription_runtime(
     loaded = LLM.from_persisted(persisted)
 
     assert loaded is not source
-    assert loaded.model == "openai/gpt-5.6"
+    assert loaded.model == "openai/gpt-5.6-sol"
     assert loaded.base_url == "https://chatgpt.com/backend-api/codex"
     assert loaded.is_subscription is True
     assert loaded.extra_headers is not None
@@ -2490,7 +2492,7 @@ def test_openai_subscription_create_llm_serializes_subscription_auth(
     monkeypatch.setattr(openai_auth, "_extract_chatgpt_account_id", lambda _: None)
 
     llm = OpenAISubscriptionAuth().create_llm(
-        model="gpt-5.6",
+        model="gpt-5.6-sol",
         credentials=OAuthCredentials(
             vendor="openai",
             access_token="access-token",
