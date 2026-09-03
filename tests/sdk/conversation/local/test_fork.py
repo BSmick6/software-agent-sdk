@@ -225,7 +225,7 @@ def test_fork_with_title_is_deprecated():
     """Passing title is accepted for backwards compat but warns and does not pollute tags."""
     with tempfile.TemporaryDirectory() as tmpdir:
         src = Conversation(agent=_agent(), persistence_dir=tmpdir, workspace=tmpdir)
-        with pytest.warns(DeprecationWarning, match="title.*deprecated"):
+        with pytest.warns(DeprecationWarning, match="title parameter is deprecated"):
             fork = src.fork(title="My Fork")
 
         assert "title" not in fork.state.tags

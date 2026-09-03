@@ -4,7 +4,6 @@ import contextlib
 import copy
 import json
 import uuid
-import warnings
 from collections.abc import Mapping, Sequence
 from pathlib import Path, PurePath
 from typing import Any, Final, TypeGuard, cast
@@ -113,6 +112,7 @@ from openhands.sdk.tool.builtins import InvokeSkillTool
 from openhands.sdk.tool.client_tool import ClientToolSpec
 from openhands.sdk.tool.schema import Action, Observation
 from openhands.sdk.utils.cipher import Cipher
+from openhands.sdk.utils.deprecation import warn_deprecated
 from openhands.sdk.workspace import LocalWorkspace
 
 
@@ -805,11 +805,14 @@ class LocalConversation(BaseConversation):
             ValueError: If ``from_event_id`` is not an event in this conversation.
         """
         if title is not None:
-            warnings.warn(
-                "The 'title' parameter of LocalConversation.fork() is deprecated and "
-                "has no effect. LocalConversation has no title field; titles are "
-                "managed by StoredConversation in the agent-server layer.",
-                DeprecationWarning,
+            warn_deprecated(
+                "LocalConversation.fork() title parameter",
+                deprecated_in="1.44.1",
+                removed_in="1.47.0",
+                details=(
+                    "LocalConversation has no title field; titles are managed by "
+                    "StoredConversation in the agent-server layer."
+                ),
                 stacklevel=2,
             )
         fork_id = conversation_id or uuid.uuid4()
