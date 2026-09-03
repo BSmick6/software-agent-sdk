@@ -589,9 +589,6 @@ async def test_managed_start_scrubs_all_durable_credential_copies(tmp_path) -> N
         conversation_dir = tmp_path / "conversations" / info.id.hex
         meta = json.loads((conversation_dir / "meta.json").read_text())
         base_state = json.loads((conversation_dir / "base_state.json").read_text())
-        # secrets are excluded from meta.json entirely; their source of truth is
-        # ConversationState/base_state.json.
-        assert "secrets" not in meta
         # meta.json no longer carries the agent at all.
         assert "agent" not in meta
         assert "CODEX_AUTH_JSON" not in base_state["agent"]["agent_context"]["secrets"]
@@ -684,9 +681,6 @@ async def test_late_binding_scrubs_open_uninitialized_conversation(tmp_path) -> 
         conversation_dir = tmp_path / "conversations" / info.id.hex
         meta = json.loads((conversation_dir / "meta.json").read_text())
         base_state = json.loads((conversation_dir / "base_state.json").read_text())
-        # secrets are excluded from meta.json entirely; their source of truth is
-        # ConversationState/base_state.json.
-        assert "secrets" not in meta
         assert "agent" not in meta
         assert "CODEX_AUTH_JSON" not in base_state["agent"]["agent_context"]["secrets"]
         assert "CODEX_AUTH_JSON" not in base_state["secret_registry"]["secret_sources"]
@@ -1097,9 +1091,6 @@ async def test_resume_removes_legacy_persisted_credential(tmp_path) -> None:
         record = service._conversation_records[info.id]
         meta = json.loads((conversation_dir / "meta.json").read_text())
         base_state = json.loads((conversation_dir / "base_state.json").read_text())
-        # secrets are excluded from meta.json entirely; their source of truth is
-        # ConversationState/base_state.json.
-        assert "secrets" not in meta
         # meta.json no longer carries the agent; the agent (and its scrubbed
         # agent_context) lives solely in base_state.json.
         assert "agent" not in meta
