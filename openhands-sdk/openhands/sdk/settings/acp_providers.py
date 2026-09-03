@@ -8,7 +8,8 @@ Each record captures the static properties that are known at configuration time
 - ``default_command``       default ``npx``-based launch command
 - ``api_key_env_var``       env var the subprocess expects for its API key
 - ``base_url_env_var``      env var for proxy/base-URL routing (or ``None``)
-- ``default_session_mode``  ACP mode ID that disables permission prompts
+- ``default_session_mode``  ACP mode ID that disables permission prompts,
+                            or ``None`` when the server has no such mode
 - ``agent_name_patterns``   lowercase substrings in the runtime agent name;
                             used by ``ACPAgent`` to auto-detect mode / protocol
 - ``supports_set_session_model``  whether the provider applies its *initial*
@@ -45,6 +46,7 @@ from openhands.sdk.settings.acp_install_catalog import (
     CLAUDE_AGENT_ACP_VERSION as CLAUDE_AGENT_ACP_VERSION,
     CODEX_ACP_VERSION as CODEX_ACP_VERSION,
     GEMINI_CLI_VERSION as GEMINI_CLI_VERSION,
+    KIMI_CODE_VERSION as KIMI_CODE_VERSION,
 )
 
 
@@ -133,6 +135,33 @@ class ACPFileSecretSpec(BaseModel):
         return value
 
 
+class ACPEnvConflictSpec(BaseModel):
+    """One provider's rule for env vars that must not coexist with a credential.
+
+    Some CLIs accept more than one credential channel and pick between them by a
+    precedence the caller cannot see, so a variable that is merely *present*
+    silently defeats the credential the user intended. Claude Code is the case
+    that motivated this: ``CLAUDE_CODE_OAUTH_TOKEN`` is a bearer validated
+    against api.anthropic.com, a co-present ``ANTHROPIC_API_KEY`` takes
+    precedence over it, and an ``ANTHROPIC_BASE_URL`` routes the bearer to a
+    proxy that rejects it.
+
+    The rule belongs to the provider, not to the process: another provider may
+    legitimately read one of these variables as its *own* credential (a
+    provider whose ``api_key_env_var`` is ``ANTHROPIC_API_KEY``), and stripping
+    it there deletes the only credential that provider has.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    dominant: str = Field(min_length=1)
+    """Env var whose presence means this provider is authenticating with it."""
+
+    strip: tuple[str, ...] = Field(min_length=1)
+    """Env vars removed from the subprocess environment when :attr:`dominant`
+    is present."""
+
+
 @dataclass(frozen=True)
 class ACPProviderInfo:
     """Immutable metadata record for one built-in ACP provider."""
@@ -160,14 +189,17 @@ class ACPProviderInfo:
     ``None`` if the provider does not support env-based base-URL override.
     """
 
-    default_session_mode: str
-    """ACP session-mode ID set right after ``session/new``.
+    default_session_mode: str | None
+    """ACP session-mode ID set right after ``session/new``, or ``None`` to skip
+    the call.
 
     For servers with a permission-suppressing mode that is the value:
     ``bypassPermissions`` (claude-agent-acp), ``agent-full-access``
     (@agentclientprotocol/codex-acp).
     gemini-cli uses ``default`` (its ``yolo`` mode errors at init); the ACP
     bridge auto-approves permission requests, so the mode doesn't gate prompts.
+    ``None`` for a server that exposes no permission mode at all — sending one
+    would fail session init to no purpose.
     """
 
     agent_name_patterns: tuple[str, ...]
@@ -290,6 +322,14 @@ class ACPProviderInfo:
     :attr:`~openhands.sdk.agent.ACPAgent.acp_isolate_data_dir`.
     """
 
+    env_conflicts: tuple[ACPEnvConflictSpec, ...] = field(default=(), compare=False)
+    """Env vars this provider's own credentials must not coexist with.
+
+    Applied to the subprocess environment by
+    :class:`~openhands.sdk.agent.ACPAgent` only for the provider that declares
+    them — see :class:`ACPEnvConflictSpec`.
+    """
+
 
 # ---------------------------------------------------------------------------
 # Curated ``acp_model`` candidate lists for the built-in providers.
@@ -375,6 +415,19 @@ _CODEX_FILE_SECRETS: tuple[ACPFileSecretSpec, ...] = (
         env_points_to="dir",
     ),
 )
+_KIMI_FILE_SECRETS: tuple[ACPFileSecretSpec, ...] = (
+    # Kimi authenticates from its config file, not the environment: the ACP
+    # auth gate resolves credentials via ``provider.env`` inside config.toml
+    # and never reads ``process.env``. Verified on 0.38.0 — a session starts
+    # only when the key is inline in the file, even with KIMI_API_KEY exported.
+    ACPFileSecretSpec(
+        secret_name="KIMI_CODE_CONFIG_TOML",
+        filename="config.toml",
+        env_var="KIMI_CODE_HOME",
+        subdir="kimi-code",
+        env_points_to="dir",
+    ),
+)
 _GEMINI_FILE_SECRETS: tuple[ACPFileSecretSpec, ...] = (
     ACPFileSecretSpec(
         secret_name="GOOGLE_APPLICATION_CREDENTIALS_JSON",
@@ -425,6 +478,17 @@ ACP_PROVIDERS: Mapping[str, ACPProviderInfo] = MappingProxyType(
             default_model="opus[1m]",
             binary_name=ACP_INSTALL_CATALOG["claude-code"].binary_name,
             data_dir_env_var="CLAUDE_CONFIG_DIR",
+            # Keyed on the credential itself, NOT on CLAUDE_CONFIG_DIR: the
+            # config dir is a *location* lever (data-dir isolation, #1019)
+            # orthogonal to which credential is active. Keying the strip on it
+            # wrongly fired during API-key isolation and missed the conflict
+            # when the token arrived via env without isolation (#3588).
+            env_conflicts=(
+                ACPEnvConflictSpec(
+                    dominant="CLAUDE_CODE_OAUTH_TOKEN",
+                    strip=("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"),
+                ),
+            ),
         ),
         "codex": ACPProviderInfo(
             key="codex",
@@ -470,6 +534,47 @@ ACP_PROVIDERS: Mapping[str, ACPProviderInfo] = MappingProxyType(
             # Gemini CLI has no dedicated config-dir var; it hard-codes
             # ``~/.gemini`` (ignoring XDG), so only HOME relocates its state.
             data_dir_env_var="HOME",
+        ),
+        "kimi-code": ACPProviderInfo(
+            key="kimi-code",
+            display_name="Kimi Code",
+            default_command=ACP_INSTALL_CATALOG["kimi-code"].npx_command(),
+            # No env-var API key: ``KIMI_API_KEY`` is read only from inside
+            # config.toml, so exporting it authenticates nothing (verified on
+            # 0.38.0, with and without a config file present). The credential
+            # is the file itself — see _KIMI_FILE_SECRETS. Kimi's env-only
+            # route is ``KIMI_MODEL_NAME`` + ``KIMI_MODEL_API_KEY``, which
+            # needs a second variable this field cannot express. See #4819.
+            api_key_env_var=None,
+            # Not an auth claim: a plain endpoint override the CLI honours as
+            # a fallback when config.toml declares no base_url.
+            base_url_env_var="KIMI_BASE_URL",
+            # Verified against Kimi Code CLI 0.38.0: ``session/set_mode``
+            # accepts ``auto``/``yolo``/``default``/``plan``. ``yolo``
+            # auto-approves tool calls while still allowing question
+            # elicitation; ``auto`` would suppress questions entirely.
+            default_session_mode="yolo",
+            # ``kimi acp`` reports ``agentInfo.name = "Kimi Code CLI"``.
+            agent_name_patterns=("kimi",),
+            supports_set_session_model=True,
+            supports_runtime_model_switch=True,
+            session_meta_key=None,
+            # Deliberately uncurated. Unlike the other three, Kimi's model
+            # ids are a property of the credential, not the plan tier: an
+            # account login offers ``kimi-code/*`` aliases, while a
+            # config.toml provider offers whatever alias the user named
+            # (verified on 0.38.0 — the ``model`` select returned the
+            # user-chosen key). A static list would therefore be wrong, not
+            # merely incomplete, for anyone not on an account login. Clients
+            # render the picker from the live session's model select instead;
+            # ``default_model=None`` leaves the CLI to pick its own default,
+            # which it resolves against whatever provider is configured.
+            available_models=(),
+            default_model=None,
+            file_secrets=_KIMI_FILE_SECRETS,
+            binary_name=ACP_INSTALL_CATALOG["kimi-code"].binary_name,
+            # ``KIMI_CODE_HOME`` relocates the ``~/.kimi-code`` data root.
+            data_dir_env_var="KIMI_CODE_HOME",
         ),
     }
 )

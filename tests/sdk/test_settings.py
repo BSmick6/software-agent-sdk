@@ -388,7 +388,13 @@ def test_export_agent_settings_schema_emits_variant_tagged_sections() -> None:
     server_field = next(f for f in acp_section.fields if f.key == "acp_server")
     assert server_field.prominence is SettingProminence.CRITICAL
     server_choices = {c.value for c in server_field.choices}
-    assert server_choices == {"claude-code", "codex", "gemini-cli", "custom"}
+    assert server_choices == {
+        "claude-code",
+        "codex",
+        "gemini-cli",
+        "kimi-code",
+        "custom",
+    }
 
     command_field = next(f for f in acp_section.fields if f.key == "acp_command")
     assert command_field.prominence is SettingProminence.MINOR
@@ -1407,7 +1413,7 @@ def test_acp_create_agent_carries_provider_key() -> None:
     directly (not from settings) defaults to ``None``; and the key survives a
     serialization round-trip through the ``AgentBase`` discriminated union.
     """
-    for server in ("claude-code", "codex", "gemini-cli", "custom"):
+    for server in ("claude-code", "codex", "gemini-cli", "kimi-code", "custom"):
         kwargs: dict[str, Any] = {"acp_server": server}
         if server == "custom":
             kwargs["acp_command"] = ["my-acp"]
@@ -1430,7 +1436,7 @@ def test_acp_resolve_command_for_known_servers(
     default stays the ``npx`` invocation.
     """
     monkeypatch.setattr(shutil, "which", lambda _: None)
-    for server in ("claude-code", "codex", "gemini-cli"):
+    for server in ("claude-code", "codex", "gemini-cli", "kimi-code"):
         settings = ACPAgentSettings(acp_server=server)
         cmd = settings.resolve_acp_command()
         assert cmd, f"expected default command for {server}, got empty"
@@ -1631,6 +1637,10 @@ def test_acp_resolve_command_queries_which_with_binary_name(
     ACPAgentSettings(acp_server="gemini-cli").resolve_acp_command()
     assert queried == ["gemini"]
 
+    queried.clear()
+    ACPAgentSettings(acp_server="kimi-code").resolve_acp_command()
+    assert queried == ["kimi"]
+
 
 def test_acp_create_agent_uses_pinned_binary_when_present(
     monkeypatch: pytest.MonkeyPatch,
@@ -1641,6 +1651,15 @@ def test_acp_create_agent_uses_pinned_binary_when_present(
     assert agent.acp_command == ["codex-acp"]
 
 
+def test_acp_create_agent_pinned_binary_preserves_subcommand(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The rewrite keeps trailing args (``acp`` subcommand) after the binary."""
+    monkeypatch.setattr(shutil, "which", _which_returning("kimi"))
+    agent = ACPAgentSettings(acp_server="kimi-code").create_agent()
+    assert agent.acp_command == ["kimi", "acp"]
+
+
 def test_acp_api_key_env_var_maps_known_servers() -> None:
     assert (
         ACPAgentSettings(acp_server="claude-code").api_key_env_var
@@ -1648,6 +1667,8 @@ def test_acp_api_key_env_var_maps_known_servers() -> None:
     )
     assert ACPAgentSettings(acp_server="codex").api_key_env_var == "OPENAI_API_KEY"
     assert ACPAgentSettings(acp_server="gemini-cli").api_key_env_var == "GEMINI_API_KEY"
+    # Kimi has no env-var API key; the credential is config.toml.
+    assert ACPAgentSettings(acp_server="kimi-code").api_key_env_var is None
     assert (
         ACPAgentSettings(acp_server="custom", acp_command=["x"]).api_key_env_var is None
     )
@@ -2178,6 +2199,8 @@ def test_acp_settings_api_key_env_var_from_registry() -> None:
     )
     assert ACPAgentSettings(acp_server="codex").api_key_env_var == "OPENAI_API_KEY"
     assert ACPAgentSettings(acp_server="gemini-cli").api_key_env_var == "GEMINI_API_KEY"
+    # Kimi has no env-var API key; the credential is config.toml.
+    assert ACPAgentSettings(acp_server="kimi-code").api_key_env_var is None
     assert (
         ACPAgentSettings(acp_server="custom", acp_command=["x"]).api_key_env_var is None
     )
@@ -2192,6 +2215,7 @@ def test_acp_settings_base_url_env_var_from_registry() -> None:
     assert (
         ACPAgentSettings(acp_server="gemini-cli").base_url_env_var == "GEMINI_BASE_URL"
     )
+    assert ACPAgentSettings(acp_server="kimi-code").base_url_env_var == "KIMI_BASE_URL"
     assert (
         ACPAgentSettings(acp_server="custom", acp_command=["x"]).base_url_env_var
         is None
@@ -2203,9 +2227,9 @@ def test_acp_resolve_command_uses_registry_defaults(
 ) -> None:
     from openhands.sdk.settings.acp_providers import ACP_PROVIDERS
 
-    # No pinned binary on PATH → registry npx default is returned verbatim.
+    # No pinned binary on PATH → registry default is returned verbatim.
     monkeypatch.setattr(shutil, "which", lambda _: None)
-    for server_key in ("claude-code", "codex", "gemini-cli"):
+    for server_key in ("claude-code", "codex", "gemini-cli", "kimi-code"):
         settings = ACPAgentSettings(acp_server=server_key)
         expected = list(ACP_PROVIDERS[server_key].default_command)
         assert settings.resolve_acp_command() == expected

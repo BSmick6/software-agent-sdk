@@ -21,7 +21,14 @@ from openhands.sdk.settings.model import ACPServerKind
 
 class TestACPProviderInfo:
     def test_known_providers_are_registered(self):
-        assert set(ACP_PROVIDERS) == {"claude-code", "codex", "gemini-cli"}
+        # A registry addition cannot be silent, but the guard that makes it so
+        # is test_acp_server_kind_matches_registry_keys — it ties the registry
+        # to the ACPServerKind Literal, which is the edit that actually has to
+        # happen. Restating the key set here only adds a literal every provider
+        # PR has to update, so this asserts the shared invariants instead.
+        assert ACP_PROVIDERS, "the registry must not be empty"
+        for key, info in ACP_PROVIDERS.items():
+            assert info.key == key, f"{key}: registry key does not match info.key"
 
     def test_all_entries_are_acp_provider_info(self):
         for info in ACP_PROVIDERS.values():
@@ -97,6 +104,38 @@ class TestACPProviderInfo:
         # Gemini CLI has no dedicated config-dir var, so only HOME relocates it.
         assert info.data_dir_env_var == "HOME"
 
+    def test_kimi_code_metadata(self):
+        info = ACP_PROVIDERS["kimi-code"]
+        assert info.key == "kimi-code"
+        assert info.display_name == "Kimi Code"
+        # Scoped package only: the unscoped npm ``kimi-code`` is a third-party
+        # tool that also ships a ``kimi`` bin.
+        assert info.default_command[:3] == ("npx", "-y", "--prefer-offline")
+        assert "@moonshot-ai/kimi-code@" in info.default_command[3]
+        assert info.default_command[4] == "acp"
+        assert info.api_key_env_var is None
+        assert info.base_url_env_var == "KIMI_BASE_URL"
+        assert info.default_session_mode == "yolo"
+        assert "kimi" in info.agent_name_patterns
+        assert info.supports_set_session_model is True
+        assert info.supports_runtime_model_switch is True
+        assert info.session_meta_key is None
+        # Model ids follow the credential, not the plan tier, so nothing is
+        # curated and the CLI resolves its own default. See
+        # _UNCURATED_MODEL_PROVIDERS.
+        assert info.available_models == ()
+        assert info.default_model is None
+        # The CLI's ACP binary is just ``kimi``; ``acp`` is a trailing arg.
+        assert info.binary_name == "kimi"
+        assert info.data_dir_env_var == "KIMI_CODE_HOME"
+        # The credential is config.toml materialised into KIMI_CODE_HOME —
+        # the env var authenticates nothing on its own.
+        assert [s.secret_name for s in info.file_secrets] == ["KIMI_CODE_CONFIG_TOML"]
+        spec = info.file_secrets[0]
+        assert spec.filename == "config.toml"
+        assert spec.env_var == "KIMI_CODE_HOME"
+        assert spec.env_points_to == "dir"
+
     def test_provider_info_is_frozen(self):
         info = ACP_PROVIDERS["claude-code"]
         with pytest.raises((AttributeError, TypeError)):
@@ -116,7 +155,7 @@ class TestACPProviderInfo:
 
 class TestGetACPProvider:
     def test_returns_info_for_known_keys(self):
-        for key in ("claude-code", "codex", "gemini-cli"):
+        for key in ("claude-code", "codex", "gemini-cli", "kimi-code"):
             result = get_acp_provider(key)
             assert result is not None
             assert result.key == key
@@ -143,6 +182,12 @@ class TestDetectACPProviderByAgentName:
         info = detect_acp_provider_by_agent_name("gemini-cli 0.38.0")
         assert info is not None
         assert info.key == "gemini-cli"
+
+    def test_detects_kimi_code_by_agent_name(self):
+        # ``kimi acp`` reports agentInfo.name "Kimi Code CLI".
+        info = detect_acp_provider_by_agent_name("Kimi Code CLI")
+        assert info is not None
+        assert info.key == "kimi-code"
 
     def test_case_insensitive_detection(self):
         assert detect_acp_provider_by_agent_name("CLAUDE-AGENT-ACP") is not None
@@ -177,6 +222,18 @@ class TestDetectACPProviderByCommand:
         assert info is not None
         assert info.key == "codex"
 
+    def test_detects_kimi_code_by_command(self):
+        # Deliberately not the pinned version: detection matches on package
+        # name, so a client may send any version.
+        info = detect_acp_provider_by_command(
+            ["npx", "-y", "@moonshot-ai/kimi-code@0.39.1", "acp"]
+        )
+        assert info is not None
+        assert info.key == "kimi-code"
+        info = detect_acp_provider_by_command(["/opt/acp-wrappers/kimi", "acp"])
+        assert info is not None
+        assert info.key == "kimi-code"
+
     def test_returns_none_for_custom_command(self):
         assert detect_acp_provider_by_command(["my-custom-acp", "serve"]) is None
 
@@ -209,15 +266,21 @@ class TestProviderRegistryConsistency:
                 f"{key}: agent_name_patterns must not be empty"
             )
 
-    def test_every_provider_has_non_empty_session_mode(self):
-        for key, info in ACP_PROVIDERS.items():
-            assert info.default_session_mode, (
-                f"{key}: default_session_mode must not be empty"
-            )
+    def test_session_mode_is_a_real_id_or_absent(self):
+        """A mode id is scoped to its own server, so the only thing worth
+        asserting registry-side is that a recorded one is a usable id.
 
-    def test_session_modes_are_distinct(self):
-        modes = [info.default_session_mode for info in ACP_PROVIDERS.values()]
-        assert len(modes) == len(set(modes)), "each provider should use a unique mode"
+        Two providers sharing a value says nothing — ``default`` is a mode
+        several ACP servers offer, and picking it for a second provider is a
+        correct record, not a collision. Whether the server accepts the id is
+        checked where it can be: against the running server, in
+        tests/sdk/agent/test_acp_conformance.py.
+        """
+        for key, info in ACP_PROVIDERS.items():
+            mode = info.default_session_mode
+            assert mode is None or (isinstance(mode, str) and mode.strip()), (
+                f"{key}: default_session_mode must be a non-empty id or None"
+            )
 
     def test_detect_returns_matching_provider_for_all_registered_patterns(self):
         """Every registered pattern should resolve back to its own provider."""
@@ -240,12 +303,36 @@ class TestProviderRegistryConsistency:
         assert set(get_args(ACPServerKind)) == set(ACP_PROVIDERS) | {"custom"}
 
 
+# Providers whose model ids depend on which credential the user supplies, so no
+# static list can be correct. Not the same as plan-tier variance, which the
+# curated lists already tolerate (they are suggestions, not access checks).
+_UNCURATED_MODEL_PROVIDERS = {
+    # An account login offers ``kimi-code/*`` aliases; a config.toml provider
+    # offers whatever alias the user named. A static list would be wrong, not
+    # merely incomplete, for anyone not on an account login.
+    "kimi-code",
+}
+
+
 class TestProviderModelLists:
     """Verify the curated ``available_models`` / ``default_model`` fields."""
 
     def test_every_builtin_provider_has_available_models(self):
         for key, info in ACP_PROVIDERS.items():
+            if key in _UNCURATED_MODEL_PROVIDERS:
+                assert not info.available_models, (
+                    f"{key}: now curates models — remove it from "
+                    "_UNCURATED_MODEL_PROVIDERS"
+                )
+                assert info.default_model is None, (
+                    f"{key}: an uncurated provider must leave default_model "
+                    "None so the CLI resolves its own default"
+                )
+                continue
             assert info.available_models, f"{key}: available_models must not be empty"
+
+    def test_every_uncurated_provider_is_a_real_registry_key(self):
+        assert _UNCURATED_MODEL_PROVIDERS <= set(ACP_PROVIDERS)
 
     def test_available_models_entries_are_model_options(self):
         for info in ACP_PROVIDERS.values():
@@ -333,13 +420,15 @@ class TestACPFileSecrets:
         assert {s.secret_name for s in specs} == {
             "CODEX_AUTH_JSON",
             "GOOGLE_APPLICATION_CREDENTIALS_JSON",
+            "KIMI_CODE_CONFIG_TOML",
         }
         # Deterministic concatenation in ACP_PROVIDERS registration order
-        # (codex before gemini-cli) — downstream callers can rely on a stable
-        # ordering of the built-in specs.
+        # (codex, gemini-cli, kimi-code) — downstream callers can rely on a
+        # stable ordering of the built-in specs.
         assert specs == (
             ACP_PROVIDERS["codex"].file_secrets
             + ACP_PROVIDERS["gemini-cli"].file_secrets
+            + ACP_PROVIDERS["kimi-code"].file_secrets
         )
 
     def test_file_secret_subdirs_are_unique_across_providers(self):

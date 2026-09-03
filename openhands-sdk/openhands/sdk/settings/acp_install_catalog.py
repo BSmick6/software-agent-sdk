@@ -63,6 +63,18 @@ class ACPInstallSpec:
     gemini-cli's ``--acp``, opencode's ``acp``). Empty for CLIs that need no
     subcommand to enter ACP mode."""
 
+    min_node_version: str | None = None
+    """Highest ``engines.node`` floor across this provider's packages, when it
+    exceeds the ecosystem baseline of ``>=20``.
+
+    The agent-server image installs every selected provider under one Node, so
+    the Dockerfile's pin has to clear the highest floor here (asserted by
+    ``tests/cross/test_agent_server_build_metadata.py``). The ``npx`` fallback
+    runs on the *host's* Node instead, where a floor that isn't met surfaces
+    only as a cryptic mid-handshake error from the CLI's own dependencies —
+    which is what this field exists to name.
+    """
+
     def npx_command(self) -> tuple[str, ...]:
         """The default ``npx``-based launch command for this provider.
 
@@ -93,6 +105,7 @@ class ACPInstallSpec:
 CLAUDE_AGENT_ACP_VERSION = "0.63.0"
 CODEX_ACP_VERSION = "1.1.7"
 GEMINI_CLI_VERSION = "0.46.0"
+KIMI_CODE_VERSION = "0.38.0"
 
 
 ACP_INSTALL_CATALOG: Mapping[str, ACPInstallSpec] = {
@@ -115,6 +128,16 @@ ACP_INSTALL_CATALOG: Mapping[str, ACPInstallSpec] = {
         packages=(ACPPackagePin("@google/gemini-cli", GEMINI_CLI_VERSION),),
         binary_name="gemini",
         trailing_args=("--acp",),
+    ),
+    "kimi-code": ACPInstallSpec(
+        key="kimi-code",
+        # Scoped package only: the unscoped npm ``kimi-code`` is an unrelated
+        # third-party tool that also ships a ``kimi`` bin.
+        packages=(ACPPackagePin("@moonshot-ai/kimi-code", KIMI_CODE_VERSION),),
+        binary_name="kimi",
+        trailing_args=("acp",),
+        # @moonshot-ai/kimi-code declares `node >=22.19.0`.
+        min_node_version="22.19.0",
     ),
 }
 """Every ACP provider installable via npm. Registry membership only makes a

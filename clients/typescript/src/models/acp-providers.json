@@ -38,6 +38,15 @@
     "default_model": "opus[1m]",
     "default_session_mode": "bypassPermissions",
     "display_name": "Claude Code",
+    "env_conflicts": [
+      {
+        "dominant": "CLAUDE_CODE_OAUTH_TOKEN",
+        "strip": [
+          "ANTHROPIC_API_KEY",
+          "ANTHROPIC_BASE_URL"
+        ]
+      }
+    ],
     "file_secrets": [],
     "key": "claude-code",
     "session_meta_key": "claudeCode",
@@ -79,6 +88,7 @@
     "default_model": "gpt-5.5",
     "default_session_mode": "agent-full-access",
     "display_name": "Codex",
+    "env_conflicts": [],
     "file_secrets": [
       {
         "env_points_to": "dir",
@@ -142,6 +152,7 @@
     "default_model": "auto",
     "default_session_mode": "default",
     "display_name": "Gemini CLI",
+    "env_conflicts": [],
     "file_secrets": [
       {
         "env_points_to": "file",
@@ -156,6 +167,41 @@
       }
     ],
     "key": "gemini-cli",
+    "session_meta_key": null,
+    "supports_runtime_model_switch": true,
+    "supports_set_session_model": true
+  },
+  "kimi-code": {
+    "agent_name_patterns": [
+      "kimi"
+    ],
+    "api_key_env_var": null,
+    "available_models": [],
+    "base_url_env_var": "KIMI_BASE_URL",
+    "binary_name": "kimi",
+    "data_dir_env_var": "KIMI_CODE_HOME",
+    "default_command": [
+      "npx",
+      "-y",
+      "--prefer-offline",
+      "@moonshot-ai/kimi-code@0.38.0",
+      "acp"
+    ],
+    "default_model": null,
+    "default_session_mode": "yolo",
+    "display_name": "Kimi Code",
+    "env_conflicts": [],
+    "file_secrets": [
+      {
+        "env_points_to": "dir",
+        "env_var": "KIMI_CODE_HOME",
+        "filename": "config.toml",
+        "secret_name": "KIMI_CODE_CONFIG_TOML",
+        "subdir": "kimi-code",
+        "warn_if_unset": []
+      }
+    ],
+    "key": "kimi-code",
     "session_meta_key": null,
     "supports_runtime_model_switch": true,
     "supports_set_session_model": true
