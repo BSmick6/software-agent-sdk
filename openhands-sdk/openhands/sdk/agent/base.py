@@ -45,6 +45,7 @@ from openhands.sdk.tool.builtins.vision_inspect import (
 )
 from openhands.sdk.utils.deprecation import deprecated
 from openhands.sdk.utils.models import DiscriminatedUnionMixin
+from openhands.sdk.utils.path import get_user_persistence_dir
 
 
 if TYPE_CHECKING:
@@ -58,10 +59,11 @@ logger = get_logger(__name__)
 
 
 # -- SOUL.md loader -------------------------------------------------------
-# SOUL.md is the agent's identity file (~/.openhands/SOUL.md).  When present
-# it replaces the default identity in the system prompt.
+# SOUL.md is the agent's identity file, ``SOUL.md`` under the user persistence
+# directory (~/.openhands/SOUL.md absent OH_PERSISTENCE_DIR).  When present it
+# replaces the default identity in the system prompt.
 
-_SOUL_PATH = os.path.join(os.path.expanduser("~"), ".openhands", "SOUL.md")
+_SOUL_PATH = get_user_persistence_dir() / "SOUL.md"
 _DEFAULT_SOUL = (
     "You are OpenHands agent, a helpful AI assistant that can interact"
     " with a computer to solve tasks."
@@ -84,7 +86,7 @@ _PRESET_BY_FILENAME: dict[str, PromptPreset] = {
 
 
 def _load_soul_md() -> str:
-    """Load ``~/.openhands/SOUL.md``, falling back to the built-in default."""
+    """Load ``SOUL.md`` from the user persistence dir, else the built-in default."""
     try:
         with open(_SOUL_PATH, encoding="utf-8") as f:
             content = f.read().strip()
