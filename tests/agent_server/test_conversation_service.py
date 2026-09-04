@@ -50,7 +50,6 @@ from openhands.sdk.git.utils import run_git_command
 from openhands.sdk.llm import MessageToolCall, TextContent
 from openhands.sdk.mcp.config import dump_mcp_config
 from openhands.sdk.secret import SecretSource, StaticSecret
-from openhands.sdk.security.confirmation_policy import NeverConfirm
 from openhands.sdk.security.risk import SecurityRisk
 from openhands.sdk.utils.cipher import Cipher
 from openhands.sdk.workspace import LocalWorkspace
@@ -1691,7 +1690,7 @@ class TestConversationServiceStartConversation:
                 # Verify EventService was created with the correct parameters
                 mock_event_service_class.assert_called_once()
                 call_args = mock_event_service_class.call_args
-                # secrets are passed directly to EventService, not via StoredConversation
+                # secrets are passed directly to EventService, not StoredConversation
                 event_service_secrets = call_args.kwargs["secrets"]
 
                 # Verify that secrets were passed to EventService
@@ -1699,8 +1698,7 @@ class TestConversationServiceStartConversation:
                 assert "api_key" in event_service_secrets
                 assert "database_url" in event_service_secrets
                 assert (
-                    event_service_secrets["api_key"].get_value()
-                    == "secret-api-key-123"
+                    event_service_secrets["api_key"].get_value() == "secret-api-key-123"
                 )
                 assert (
                     event_service_secrets["database_url"].get_value()
@@ -1752,7 +1750,7 @@ class TestConversationServiceStartConversation:
                 # Verify EventService was created with the correct parameters
                 mock_event_service_class.assert_called_once()
                 call_args = mock_event_service_class.call_args
-                # secrets are passed directly to EventService, not via StoredConversation
+                # secrets are passed directly to EventService, not StoredConversation
                 event_service_secrets = call_args.kwargs["secrets"]
 
                 # Verify that secrets is an empty dict (default)
@@ -2115,7 +2113,6 @@ class TestConversationServiceStartConversation:
                 mock_new_service.stored = StoredConversation(
                     id=custom_id,
                     workspace=request.workspace,
-                    confirmation_policy=request.confirmation_policy,
                     initial_message=request.initial_message,
                     metrics=None,
                     created_at=datetime(2025, 1, 1, 12, 0, 0, tzinfo=UTC),
@@ -2126,7 +2123,6 @@ class TestConversationServiceStartConversation:
                     agent=request.agent,
                     workspace=request.workspace,
                     execution_status=ConversationExecutionStatus.IDLE,
-                    confirmation_policy=request.confirmation_policy,
                 )
                 mock_new_service.get_state.return_value = mock_state
                 mock_start.return_value = mock_new_service

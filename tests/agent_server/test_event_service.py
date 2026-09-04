@@ -13,6 +13,7 @@ from uuid import uuid4
 
 import pytest
 import pytest_asyncio
+from pydantic import SecretStr
 
 from openhands.agent_server.conversation_lease import LEASE_FILE_NAME
 from openhands.agent_server.conversation_service import ConversationService
@@ -51,7 +52,6 @@ from openhands.sdk.io.local import LocalFileStore
 from openhands.sdk.io.memory import InMemoryFileStore
 from openhands.sdk.llm import MessageToolCall, TextContent
 from openhands.sdk.mcp.config import coerce_mcp_config
-from openhands.sdk.security.confirmation_policy import NeverConfirm
 from openhands.sdk.subagent.schema import AgentDefinition
 from openhands.sdk.utils.cipher import Cipher
 from openhands.sdk.workspace import LocalWorkspace
@@ -3580,7 +3580,7 @@ class TestMutationsOwnedByConversationState:
         service = EventService(
             stored=stored,
             conversations_dir=tmp_path,
-            secrets={"MY_KEY": StaticSecret(value="hunter2")},
+            secrets={"MY_KEY": StaticSecret(value=SecretStr("hunter2"))},
         )
         (tmp_path / stored.id.hex).mkdir(parents=True, exist_ok=True)
         await service.save_meta()
@@ -3610,7 +3610,9 @@ class TestMutationsOwnedByConversationState:
         await service.set_confirmation_policy(AlwaysConfirm())
 
         mock_conv.set_confirmation_policy.assert_called_once()
-        assert isinstance(mock_conv.set_confirmation_policy.call_args[0][0], AlwaysConfirm)
+        assert isinstance(
+            mock_conv.set_confirmation_policy.call_args[0][0], AlwaysConfirm
+        )
 
     @pytest.mark.asyncio
     async def test_set_security_analyzer_delegates_to_conversation(self, tmp_path):
@@ -3647,7 +3649,7 @@ class TestMutationsOwnedByConversationState:
         mock_conv = MagicMock()
         service._conversation = mock_conv
 
-        secret = StaticSecret(value="hunter2")
+        secret = StaticSecret(value=SecretStr("hunter2"))
         await service.update_secrets({"MY_KEY": secret})
 
         mock_conv.update_secrets.assert_called_once_with({"MY_KEY": secret})
@@ -3722,4 +3724,6 @@ class TestMutationsOwnedByConversationState:
             await service.start()
 
         mock_conv.set_confirmation_policy.assert_called_once()
-        assert isinstance(mock_conv.set_confirmation_policy.call_args[0][0], AlwaysConfirm)
+        assert isinstance(
+            mock_conv.set_confirmation_policy.call_args[0][0], AlwaysConfirm
+        )

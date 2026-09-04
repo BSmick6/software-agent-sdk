@@ -2752,7 +2752,9 @@ class LocalConversation(BaseConversation):
         """
         with self._state:
             registry = self._state.secret_registry.model_copy(
-                update={"secret_sources": dict(self._state.secret_registry.secret_sources)}
+                update={
+                    "secret_sources": dict(self._state.secret_registry.secret_sources)
+                }
             )
             registry.update_secrets(secrets)
             self._state.secret_registry = registry

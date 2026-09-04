@@ -91,7 +91,9 @@ class AgentLaunchAdditions(BaseModel):
 
 
 class ConversationConfig(BaseModel):
-    """Shared conversation configuration — everything except the agent and init-only fields.
+    """Shared conversation configuration.
+
+    Covers everything except the agent and init-only fields.
 
     This is the common base for :class:`StartConversationRequest` (which adds the
     ``agent``/``agent_settings``/``agent_profile_id`` family and init-only fields

@@ -1088,7 +1088,6 @@ async def test_resume_removes_legacy_persisted_credential(tmp_path) -> None:
         )
 
         assert not started
-        record = service._conversation_records[info.id]
         meta = json.loads((conversation_dir / "meta.json").read_text())
         base_state = json.loads((conversation_dir / "base_state.json").read_text())
         # meta.json no longer carries the agent; the agent (and its scrubbed

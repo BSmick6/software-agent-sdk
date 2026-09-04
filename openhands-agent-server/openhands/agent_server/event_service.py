@@ -195,7 +195,6 @@ class EventService:
                 )
             )
 
-
     async def _scrub_persisted_credentials(
         self,
         credential_bindings: Mapping[str, VersionedCredentialBinding] | None = None,
