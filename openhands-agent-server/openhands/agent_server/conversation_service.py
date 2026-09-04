@@ -1925,7 +1925,9 @@ class ConversationService:
         loop = asyncio.get_running_loop()
         state = await event_service.get_state()
         new_tags = dict(event_service.stored.tags)
-        state = await loop.run_in_executor(None, _update_state_tags_sync, state, new_tags)
+        state = await loop.run_in_executor(
+            None, _update_state_tags_sync, state, new_tags
+        )
         record = self._conversation_records.get(conversation_id)
         if record is not None:
             record.stored = event_service.stored
