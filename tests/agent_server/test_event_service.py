@@ -55,10 +55,8 @@ from openhands.sdk.io.local import LocalFileStore
 from openhands.sdk.io.memory import InMemoryFileStore
 from openhands.sdk.llm import MessageToolCall, TextContent
 from openhands.sdk.mcp.config import coerce_mcp_config
-from openhands.sdk.secret import StaticSecret
 from openhands.sdk.subagent.schema import AgentDefinition
 from openhands.sdk.utils.cipher import FERNET_TOKEN_PREFIX, Cipher
-from openhands.sdk.utils.pydantic_secrets import REDACTED_SECRET_VALUE
 from openhands.sdk.workspace import LocalWorkspace
 from openhands.tools.terminal import TerminalAction, TerminalObservation
 from tests.agent_server.stress.scripts import (
@@ -2123,14 +2121,12 @@ class TestEventServiceSaveMeta:
     async def test_trajectory_zip_built_during_save_meta_has_no_partial_meta_json(
         self, sample_stored_conversation, tmp_path, monkeypatch
     ):
-        """A trajectory zip built mid-save holds a complete, redacted meta.json.
+        """A trajectory zip built mid-save holds a complete meta.json.
 
-        Partial JSON does not parse, so the zip cannot redact it, and the
-        encrypted secrets in it would be archived as they are.
+        Partial JSON does not parse, so the zip could not redact it. meta.json no
+        longer carries secrets (they live only in base_state.json), but the zip
+        must still never archive a half-written file.
         """
-        sample_stored_conversation.secrets = {
-            "GITHUB_TOKEN": StaticSecret(value=SecretStr("ghp_zip_during_save"))
-        }
         service = EventService(
             stored=sample_stored_conversation,
             conversations_dir=tmp_path,
@@ -2138,8 +2134,6 @@ class TestEventServiceSaveMeta:
         )
         service.conversation_dir.mkdir()
         await service.save_meta()
-        meta_file = service.conversation_dir / "meta.json"
-        assert FERNET_TOKEN_PREFIX in meta_file.read_text()
         archive_path = tmp_path / "trajectory.zip"
         _pause_text_writes_halfway(
             monkeypatch,
@@ -2157,7 +2151,8 @@ class TestEventServiceSaveMeta:
             if FERNET_TOKEN_PREFIX.encode() in data
         ]
         meta = json.loads(members[f"{service.stored.id.hex}/meta.json"])
-        assert meta["secrets"]["GITHUB_TOKEN"]["value"] == REDACTED_SECRET_VALUE
+        assert StoredConversation.model_validate(meta).id == service.stored.id
+        assert "secrets" not in meta
 
     @pytest.mark.asyncio
     async def test_switch_acp_model_persists_via_conversation(self, tmp_path):
