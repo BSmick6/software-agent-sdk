@@ -13,7 +13,7 @@ from uuid import UUID, uuid4
 from weakref import WeakValueDictionary
 
 import httpx
-from pydantic import BaseModel, TypeAdapter
+from pydantic import BaseModel
 
 from openhands.agent_server.config import ACPSkillSourcing, Config, WebhookSpec
 from openhands.agent_server.conversation_lease import (
@@ -23,7 +23,20 @@ from openhands.agent_server.conversation_lease import (
 from openhands.agent_server.event_service import (
     LEASE_RENEW_INTERVAL_SECONDS,
     EventService,
-    _without_agent_context_secret,
+    RunSlot,
+)
+from openhands.agent_server.launch import (
+    is_codex_source,
+    launch_source,
+    live_launch_runtime,
+    request_secrets,
+    request_security_analyzer,
+    scoped_secrets,
+    server_launch_stores,
+)
+from openhands.agent_server.local_storage import (
+    conversation_worktree_dir,
+    remove_conversation_worktree,
 )
 from openhands.agent_server.models import (
     ConversationInfo,
@@ -37,7 +50,6 @@ from openhands.agent_server.models import (
 from openhands.agent_server.persistence import FileSecretsStore
 from openhands.agent_server.pub_sub import Subscriber
 from openhands.agent_server.server_details_router import update_last_execution_time
-from openhands.agent_server.skills_service import discover_profile_skills
 from openhands.agent_server.telemetry import (
     ConversationTelemetryContext,
     DiagnosticEventFactory,
@@ -47,7 +59,7 @@ from openhands.agent_server.telemetry import (
 )
 from openhands.agent_server.telemetry.sanitizer import model_family, safe_token
 from openhands.agent_server.utils import safe_rmtree, utc_now
-from openhands.sdk import LLM, AgentContext, Event, Message
+from openhands.sdk import LLM, Event, Message
 from openhands.sdk.agent import ACPAgent
 from openhands.sdk.agent.acp_file_credentials import CODEX_AUTH_SECRET_NAME
 from openhands.sdk.agent.base import AgentBase
@@ -61,11 +73,17 @@ from openhands.sdk.conversation.title_utils import (
     extract_message_text,
     generate_title_from_message,
 )
-from openhands.sdk.credential import CredentialBindingError, VersionedCredentialBinding
+from openhands.sdk.credential import (
+    CredentialAuthorizationRejected,
+    CredentialBindingError,
+    VersionedCredentialBinding,
+)
 from openhands.sdk.event import MessageEvent
 from openhands.sdk.event.conversation_state import ConversationStateUpdateEvent
 from openhands.sdk.git.exceptions import GitCommandError, GitRepositoryError
 from openhands.sdk.git.utils import run_git_command, validate_git_repository
+from openhands.sdk.launch import LaunchedAgent, finalize
+from openhands.sdk.llm.call_context import LLMCallContext
 from openhands.sdk.mcp.utils import MCPToolProvider
 from openhands.sdk.observability import OPERATION_METADATA_KEY, observe
 from openhands.sdk.secret import SecretSource
@@ -74,14 +92,13 @@ from openhands.sdk.security.confirmation_policy import (
     ConfirmationPolicyBase,
     NeverConfirm,
 )
-from openhands.sdk.tool import BROWSER_TOOL_NAME, Tool, is_tool_usable
 from openhands.sdk.tool.client_tool import register_client_tools
+from openhands.sdk.tool.registry import get_tool_module_qualnames
 from openhands.sdk.utils.cipher import Cipher
 from openhands.sdk.workspace import LocalWorkspace
 
 
 if TYPE_CHECKING:
-    from openhands.sdk.mcp.config import MCPServer
     from openhands.sdk.subagent.schema import AgentDefinition
 
 
@@ -108,47 +125,6 @@ def _build_worktree_guidance(
         "Do all file and git work inside this worktree. Do your work on a new, "
         "appropriately-named branch, based off the main/master branch, "
         "and do not switch back to the original workspace."
-    )
-
-
-def _append_worktree_guidance(
-    agent: AgentBase,
-    *,
-    source_workspace: Path,
-    worktree_root: Path,
-    workspace_dir: Path,
-    branch: str,
-) -> AgentBase:
-    guidance = _build_worktree_guidance(
-        source_workspace=source_workspace,
-        worktree_root=worktree_root,
-        workspace_dir=workspace_dir,
-        branch=branch,
-    )
-    return _append_system_message_suffix(agent, guidance)
-
-
-def _append_system_message_suffix(agent: AgentBase, addition: str) -> AgentBase:
-    context = agent.agent_context or AgentContext()
-    existing_suffix = (context.system_message_suffix or "").strip()
-    suffix = f"{existing_suffix}\n\n{addition}" if existing_suffix else addition
-    updated_context = context.model_copy(update={"system_message_suffix": suffix})
-    return agent.model_copy(update={"agent_context": updated_context})
-
-
-def _with_load_memory(agent: AgentBase) -> AgentBase:
-    """Stamp the global persistent-memory preference onto an agent.
-
-    ``load_memory`` is a user-level setting, not part of any agent, profile or
-    client payload, so it is applied here regardless of how the agent reached
-    the request.
-    """
-    # current_datetime stays suppressed on a synthesized context: a null
-    # agent_context means "no prompt context", and ACPAgent._render_suffix
-    # relies on that to keep a <CURRENT_DATETIME> block out of the prompt.
-    context = agent.agent_context or AgentContext(current_datetime=None)
-    return agent.model_copy(
-        update={"agent_context": context.model_copy(update={"load_memory": True})}
     )
 
 
@@ -214,11 +190,29 @@ def _get_worktree_start_point(repo_root: Path) -> str:
     return "HEAD"
 
 
-def _create_conversation_worktree(
+@dataclass(frozen=True)
+class _WorktreePlan:
+    repo_root: Path
+    source_workspace: Path
+    worktree_root: Path
+    workspace_dir: Path
+    branch: str
+
+    @property
+    def guidance(self) -> str:
+        return _build_worktree_guidance(
+            source_workspace=self.source_workspace,
+            worktree_root=self.worktree_root,
+            workspace_dir=self.workspace_dir,
+            branch=self.branch,
+        )
+
+
+def _plan_conversation_worktree(
     workspace: LocalWorkspace,
     conversation_id: UUID,
     conversation_worktree_root: Path,
-) -> tuple[LocalWorkspace, Path, Path, str] | None:
+) -> _WorktreePlan | None:
     source_workspace = Path(workspace.working_dir).resolve()
     try:
         validate_git_repository(source_workspace)
@@ -231,25 +225,33 @@ def _create_conversation_worktree(
     except (GitCommandError, GitRepositoryError):
         return None
 
-    relative_workspace = source_workspace.relative_to(repo_root)
-    conversation_worktree_dir = conversation_worktree_root / str(conversation_id)
-    worktree_root = conversation_worktree_dir / repo_root.name
-    conversation_worktree_dir.mkdir(parents=True, exist_ok=True)
-    branch = f"openhands/{conversation_id}"
+    worktree_root = conversation_worktree_root / str(conversation_id) / repo_root.name
+    return _WorktreePlan(
+        repo_root=repo_root,
+        source_workspace=source_workspace,
+        worktree_root=worktree_root,
+        workspace_dir=worktree_root / source_workspace.relative_to(repo_root),
+        branch=f"openhands/{conversation_id}",
+    )
 
-    if worktree_root.exists():
+
+def _create_conversation_worktree(plan: _WorktreePlan) -> LocalWorkspace:
+    repo_root = plan.repo_root
+    plan.worktree_root.parent.mkdir(parents=True, exist_ok=True)
+
+    if plan.worktree_root.exists():
         try:
             run_git_command(
-                ["git", "worktree", "remove", "--force", str(worktree_root)],
+                ["git", "worktree", "remove", "--force", str(plan.worktree_root)],
                 repo_root,
             )
         except GitCommandError:
-            safe_rmtree(worktree_root)
+            safe_rmtree(plan.worktree_root)
 
     run_git_command(["git", "worktree", "prune"], repo_root)
 
-    if run_git_command(["git", "branch", "--list", branch], repo_root):
-        run_git_command(["git", "branch", "-D", branch], repo_root)
+    if run_git_command(["git", "branch", "--list", plan.branch], repo_root):
+        run_git_command(["git", "branch", "-D", plan.branch], repo_root)
 
     run_git_command(
         [
@@ -257,47 +259,15 @@ def _create_conversation_worktree(
             "worktree",
             "add",
             "-b",
-            branch,
-            str(worktree_root),
+            plan.branch,
+            str(plan.worktree_root),
             _get_worktree_start_point(repo_root),
         ],
         repo_root,
     )
 
-    workspace_dir = worktree_root / relative_workspace
-    workspace_dir.mkdir(parents=True, exist_ok=True)
-    return (
-        LocalWorkspace(working_dir=workspace_dir),
-        source_workspace,
-        worktree_root,
-        branch,
-    )
-
-
-def _prepare_request_workspace(
-    request: StartConversationRequest,
-    conversation_id: UUID,
-    conversation_worktree_root: Path,
-) -> StartConversationRequest:
-    if not request.worktree:
-        return request
-
-    worktree = _create_conversation_worktree(
-        request.workspace, conversation_id, conversation_worktree_root
-    )
-    if worktree is None:
-        return request
-
-    new_workspace, source_workspace, worktree_root, branch = worktree
-    assert request.agent is not None
-    agent = _append_worktree_guidance(
-        request.agent,
-        source_workspace=source_workspace,
-        worktree_root=worktree_root,
-        workspace_dir=Path(new_workspace.working_dir),
-        branch=branch,
-    )
-    return request.model_copy(update={"workspace": new_workspace, "agent": agent})
+    plan.workspace_dir.mkdir(parents=True, exist_ok=True)
+    return LocalWorkspace(working_dir=plan.workspace_dir)
 
 
 logger = logging.getLogger(__name__)
@@ -310,153 +280,6 @@ class InvalidParentConversation(ValueError):
 
 def _same_workspace(a: LocalWorkspace, b: LocalWorkspace) -> bool:
     return Path(a.working_dir).resolve() == Path(b.working_dir).resolve()
-
-
-def _apply_acp_skill_sourcing(
-    agent: "AgentBase", sourcing: ACPSkillSourcing
-) -> "AgentBase":
-    """Strip OpenHands-managed skills from an ACP agent under ``native`` sourcing.
-
-    A host-local ACP CLI reads the user's own skills from its home directory, so
-    a second, OpenHands-managed set injected into its prompt is at best noise —
-    and the catalog listing tells it to call ``invoke_skill``, a tool no ACP
-    agent has. Container runtimes set ``openhands_managed`` because that home
-    configuration is absent there. Project skills are excluded either way, by
-    ``ACPAgent`` itself (#4019).
-
-    A caller that sends ``agent`` / ``agent_settings`` puts its own skills on the
-    context, so the strip happens here rather than at profile resolution.
-    """
-    if sourcing != "native" or not isinstance(agent, ACPAgent):
-        return agent
-    context = agent.agent_context
-    if context is None:
-        return agent
-    if not (
-        context.skills
-        or context.load_user_skills
-        or context.load_public_skills
-        or context.registered_marketplaces
-    ):
-        return agent
-    return agent.model_copy(
-        update={
-            "agent_context": context.model_copy(
-                update={
-                    "skills": [],
-                    "load_user_skills": False,
-                    "load_public_skills": False,
-                    "registered_marketplaces": [],
-                }
-            )
-        }
-    )
-
-
-def _resolve_agent_from_profile(
-    profile_id: "UUID",
-    cipher: "Cipher | None",
-    mcp_config: "dict[str, MCPServer]",
-    acp_skill_sourcing: ACPSkillSourcing = "native",
-) -> "tuple[AgentBase, LaunchedAgentProfile]":
-    """Load and resolve an agent profile by id, returning the built agent + provenance.
-
-    Runs synchronously (call via ``asyncio.to_thread`` from async context).
-
-    Args:
-        mcp_config: Global MCP servers already loaded by the caller using the
-            server's cipher.  Passed explicitly so this free function never
-            touches the settings-store singleton (which may not have been
-            initialised with the correct cipher yet).
-        acp_skill_sourcing: This deployment's ACP skill policy
-            (``Config.acp_skill_sourcing``).  Decides whether an ACP profile is
-            resolved with the server's managed skill catalog or with none.
-
-    Raises:
-        ProfileNotFound: No stored profile has ``profile_id``.
-        DanglingMcpServerRef: A referenced MCP server is absent from the global config.
-        ValueError: Profile load or settings validation failure.
-    """
-    from openhands.agent_server.persistence.store import (
-        get_agent_profile_store,
-        get_llm_profile_store,
-    )
-    from openhands.sdk.profiles.resolver import ProfileNotFound, resolve_agent_profile
-    from openhands.sdk.settings.model import OpenHandsAgentSettings
-
-    store = get_agent_profile_store()
-    profile_name = store.name_for_id(profile_id)
-    if profile_name is None:
-        raise ProfileNotFound(f"Agent profile with id '{profile_id}' not found")
-
-    try:
-        profile = store.load(profile_name)
-    except FileNotFoundError:
-        raise ProfileNotFound(
-            f"Agent profile '{profile_name}' (id={profile_id}) not found"
-        )
-    except ValueError as exc:
-        raise ValueError(
-            f"Failed to load agent profile '{profile_name}': {exc}"
-        ) from exc
-
-    # OpenHands profiles get the discovered catalog minus their ``disabled_skills``
-    # deny-list. An ACP profile gets it only where the CLI cannot reach the user's
-    # own configuration (``openhands_managed``); under ``native`` it sources its
-    # own skills and OpenHands injects none (#4019). A genuine discovery failure
-    # fails the launch loudly rather than silently producing a zero-skill agent.
-    available_skills = None
-    wants_skills = profile.agent_kind == "openhands" or (
-        acp_skill_sourcing == "openhands_managed"
-    )
-    if wants_skills:
-        try:
-            available_skills = discover_profile_skills()
-        except Exception as exc:
-            raise ValueError(
-                f"Skill discovery failed for profile '{profile_name}': {exc}"
-            ) from exc
-
-    llm_store = get_llm_profile_store()
-    try:
-        settings_config = resolve_agent_profile(
-            profile,
-            llm_store=llm_store,
-            mcp_config=mcp_config,
-            available_skills=available_skills,
-            cipher=cipher,
-        )
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"Profile '{profile_name}' failed to resolve: {exc}") from exc
-
-    if isinstance(settings_config, OpenHandsAgentSettings):
-        # Force streaming so this launch path wires on_token: a client can't set
-        # llm.stream on a profile's referenced LLM ahead of time. Safe at this
-        # layer (not the SDK resolver) because this server wires the token
-        # callback whenever any llm.stream is set; a headless resolver caller
-        # that never wires on_token is covered by LLM's graceful degradation.
-        settings_config = settings_config.model_copy(
-            update={"llm": settings_config.llm.model_copy(update={"stream": True})}
-        )
-
-    agent = settings_config.create_agent()
-    # Browser is deliberately absent from the deterministic SDK default
-    # (environment-dependent); this server knows its runtime, so it injects
-    # browser when usable. An explicit profile.tools list is authoritative.
-    if (
-        profile.agent_kind == "openhands"
-        and profile.tools is None
-        and is_tool_usable(BROWSER_TOOL_NAME)
-    ):
-        agent = agent.model_copy(
-            update={"tools": [*agent.tools, Tool(name=BROWSER_TOOL_NAME)]}
-        )
-
-    launched = LaunchedAgentProfile(
-        agent_profile_id=profile.id,
-        revision=profile.revision,
-    )
-    return agent, launched
 
 
 def _compose_conversation_info(
@@ -534,6 +357,7 @@ def _compose_conversation_info(
         available_models=available_models,
         supports_runtime_model_switch=supports_runtime_model_switch,
         client_tools=stored.client_tools,
+        tool_module_qualnames=dict(stored.tool_module_qualnames),
         launched_agent_profile=stored.launched_agent_profile,
     )
 
@@ -689,6 +513,7 @@ class ConversationService:
     webhook_specs: list[WebhookSpec] = field(default_factory=list)
     session_api_key: str | None = field(default=None)
     cipher: Cipher | None = None
+    runtime_cipher_resolver: Callable[[UUID], Cipher] | None = None
     mcp_tool_provider: MCPToolProvider | None = None
     secrets_store: FileSecretsStore | None = None
     owner_instance_id: str = field(default_factory=lambda: uuid4().hex)
@@ -699,6 +524,7 @@ class ConversationService:
         default=Path("/tmp/conversation-worktrees")
     )
     acp_skill_sourcing: ACPSkillSourcing = "native"
+    enable_browser: bool = True
     _event_services: dict[UUID, EventService] | None = field(default=None, init=False)
     _conversation_records: dict[UUID, _ConversationRecord] = field(
         default_factory=dict, init=False
@@ -718,20 +544,28 @@ class ConversationService:
     _lease_renewal_task: asyncio.Task | None = field(default=None, init=False)
     _eviction_task: asyncio.Task | None = field(default=None, init=False)
     _run_executor: ThreadPoolExecutor | None = field(default=None, init=False)
+    _run_semaphore: asyncio.Semaphore | None = field(default=None, init=False)
     _credential_bindings: dict[UUID, dict[str, VersionedCredentialBinding]] = field(
         default_factory=dict, init=False
     )
 
-    def _load_catalog_sync(self) -> dict[UUID, _ConversationRecord]:
+    def _load_catalog_sync(
+        self, conversation_id: UUID | None = None
+    ) -> dict[UUID, _ConversationRecord]:
         records: dict[UUID, _ConversationRecord] = {}
-        for conversation_dir in self.conversations_dir.iterdir():
+        directories = (
+            [self.conversations_dir / conversation_id.hex]
+            if conversation_id is not None
+            else self.conversations_dir.iterdir()
+        )
+        for conversation_dir in directories:
             meta_file = conversation_dir / "meta.json"
             if not meta_file.exists():
                 continue
             try:
                 stored = StoredConversation.model_validate_json(
                     meta_file.read_text(),
-                    context={"cipher": self.cipher},
+                    context={"cipher": self._cipher_for(UUID(conversation_dir.name))},
                 )
                 execution_status = ConversationExecutionStatus.IDLE
                 base_state_file = conversation_dir / BASE_STATE
@@ -774,13 +608,19 @@ class ConversationService:
             record.base_state_path = path
         return path
 
+    def _cipher_for(self, conversation_id: UUID) -> Cipher | None:
+        if self.runtime_cipher_resolver is not None:
+            return self.runtime_cipher_resolver(conversation_id)
+        return self.cipher
+
     def _load_persisted_state_sync(
         self, conversation_id: UUID
     ) -> ConversationState | None:
         base_state_file = self.conversations_dir / conversation_id.hex / BASE_STATE
         if not base_state_file.exists():
             return None
-        context = {"cipher": self.cipher} if self.cipher else None
+        cipher = self._cipher_for(conversation_id)
+        context = {"cipher": cipher} if cipher else None
         return ConversationState.model_validate_json(
             base_state_file.read_text(), context=context
         )
@@ -825,6 +665,18 @@ class ConversationService:
                 if event_services is not None
                 else None
             )
+            record = self._conversation_records.get(conversation_id)
+            stored = (
+                event_service.stored
+                if event_service is not None
+                else (record.stored if record is not None else None)
+            )
+            if stored is not None and not self._profile_allows_secret(
+                stored, secret_name
+            ):
+                raise CredentialAuthorizationRejected(
+                    "The launched agent profile excludes this credential"
+                )
             if event_service is not None and event_service.is_open():
                 await event_service.activate_credential_binding(secret_name, binding)
                 record = self._conversation_records.get(conversation_id)
@@ -867,6 +719,11 @@ class ConversationService:
             self._credential_bindings = {}
 
     @staticmethod
+    def _profile_allows_secret(stored: StoredConversation, name: str) -> bool:
+        profile = stored.launched_agent_profile
+        return profile is None or profile.allows_secret(name)
+
+    @staticmethod
     def _is_codex_agent(agent: AgentBase | None) -> bool:
         return isinstance(agent, ACPAgent) and agent.acp_server == "codex"
 
@@ -891,9 +748,14 @@ class ConversationService:
         # ``_load_persisted_state_sync`` usage elsewhere.
         if agent is None:
             agent = await asyncio.to_thread(self._agent_from_base_state, stored.id)
-        bindings = self._credential_bindings.pop(stored.id, {})
+        bindings = {
+            name: binding
+            for name, binding in self._credential_bindings.pop(stored.id, {}).items()
+            if self._profile_allows_secret(stored, name)
+        }
         if (
-            CODEX_AUTH_SECRET_NAME not in bindings
+            self._profile_allows_secret(stored, CODEX_AUTH_SECRET_NAME)
+            and CODEX_AUTH_SECRET_NAME not in bindings
             and self._is_codex_agent(agent)
             and await self._has_local_codex_credential()
         ):
@@ -1067,13 +929,28 @@ class ConversationService:
             record.cached_info = None
             record.state_signature = signature
 
-    async def _reconcile_active_records(self) -> None:
-        """Fill catalog entries for services injected outside normal startup.
+    async def refresh_persisted_conversation(self, conversation_id: UUID) -> None:
+        """Refresh one catalog record changed by an external runtime."""
+        event_services = self._event_services
+        if event_services is None:
+            raise ValueError("inactive_service")
+        disk_records = await asyncio.to_thread(self._load_catalog_sync, conversation_id)
+        if conversation_id not in disk_records:
+            event_service = event_services.get(conversation_id)
+            if event_service is None or not event_service.is_open():
+                self._conversation_records.pop(conversation_id, None)
+            return
+        record = disk_records[conversation_id]
+        event_service = event_services.get(conversation_id)
+        if event_service is not None and event_service.is_open():
+            return
+        existing = self._conversation_records.setdefault(conversation_id, record)
+        if existing.stored != record.stored:
+            existing.stored = record.stored
+            existing.cached_info = None
 
-        Normal service lifecycle paths maintain the catalog themselves. This
-        small reconciliation keeps direct embedders and existing test fixtures
-        that populate ``_event_services`` compatible.
-        """
+    async def _reconcile_active_records(self) -> None:
+        """Add injected live services to the in-memory catalog."""
         event_services = self._event_services
         if event_services is None:
             raise ValueError("inactive_service")
@@ -1200,7 +1077,7 @@ class ConversationService:
         await asyncio.to_thread(self._prepare_persisted_runtime, record.stored)
         try:
             return await self._start_event_service(
-                record.stored, agent=agent, secrets=secrets
+                record.stored, persisted_agent=agent, secrets=secrets
             )
         except ConversationLeaseHeldError as exc:
             logger.debug(
@@ -1411,6 +1288,143 @@ class ConversationService:
 
     # Write Methods
 
+    def _has_conversation(self, conversation_id: UUID) -> bool:
+        """Whether this id is already known to the service.
+
+        Cheap, non-awaiting hint used to choose the reuse or create path.
+        The create path re-checks under the lifecycle lock, because a
+        concurrent create for the same id can commit in between.
+        """
+        event_services = self._event_services
+        if event_services is None:
+            return False
+        existing_record = self._conversation_records.get(conversation_id)
+        existing_event_service = event_services.get(conversation_id)
+        return existing_record is not None or (
+            existing_event_service is not None and existing_event_service.is_open()
+        )
+
+    async def _reuse_existing_conversation_locked(
+        self,
+        conversation_id: UUID,
+        request: StartConversationRequest,
+    ) -> tuple[ConversationInfo, bool]:
+        """Reuse an existing conversation without recreating it.
+
+        The caller must hold this conversation's lifecycle lock, so the
+        catalog cannot change between the existence check and the reuse.
+        """
+        if self._event_services is None:
+            raise ValueError("inactive_service")
+        existing_record = self._conversation_records.get(conversation_id)
+        existing_event_service = self._event_services.get(conversation_id)
+        stored = (
+            existing_event_service.stored
+            if existing_event_service is not None
+            else existing_record.stored
+            if existing_record is not None
+            else None
+        )
+        if stored is not None:
+            request = request.model_copy(
+                update={
+                    "secrets": {
+                        name: value
+                        for name, value in request.secrets.items()
+                        if self._profile_allows_secret(stored, name)
+                    }
+                }
+            )
+        if existing_event_service is not None and existing_event_service.is_open():
+            # ``is_open()`` above guarantees a live conversation, so the
+            # public getter never raises here.
+            existing_agent = existing_event_service.get_conversation().agent
+            if (
+                self._is_codex_agent(existing_agent)
+                and CODEX_AUTH_SECRET_NAME
+                not in existing_event_service.credential_bindings
+            ):
+                # Reuse the live agent we already resolved above instead
+                # of letting _resolve_credential_bindings fall back to a
+                # synchronous base_state.json read.
+                late_bindings = await self._resolve_credential_bindings(
+                    existing_event_service.stored, agent=existing_agent
+                )
+                try:
+                    for secret_name, binding in late_bindings.items():
+                        await existing_event_service.activate_credential_binding(
+                            secret_name,
+                            binding,
+                        )
+                except Exception:
+                    pending = self._credential_bindings.setdefault(conversation_id, {})
+                    for secret_name, binding in late_bindings.items():
+                        pending.setdefault(secret_name, binding)
+                    raise
+            if (
+                CODEX_AUTH_SECRET_NAME in request.secrets
+                and CODEX_AUTH_SECRET_NAME
+                not in existing_event_service.credential_bindings
+            ):
+                await existing_event_service.apply_resume_secrets(
+                    {CODEX_AUTH_SECRET_NAME: request.secrets[CODEX_AUTH_SECRET_NAME]}
+                )
+            state = await existing_event_service.get_state()
+            self._conversation_records[conversation_id] = _ConversationRecord(
+                stored=existing_event_service.stored,
+                execution_status=state.execution_status,
+            )
+            return (
+                _compose_conversation_info(
+                    existing_event_service.stored,
+                    state,
+                    self._children_of(conversation_id),
+                ),
+                False,
+            )
+        if existing_record is None:
+            raise ValueError(f"Persisted conversation {conversation_id} has no record")
+        # Read base_state.json off the event loop, matching the
+        # asyncio.to_thread pattern used for the same read elsewhere
+        # (_resolve_credential_bindings, _conversation_info).
+        reattach_agent = await asyncio.to_thread(
+            self._agent_from_base_state, conversation_id
+        )
+        managed_codex_credential = self._is_codex_agent(reattach_agent) and (
+            CODEX_AUTH_SECRET_NAME in self._credential_bindings.get(conversation_id, {})
+            or await self._has_local_codex_credential()
+        )
+        fallback_secret = request.secrets.get(CODEX_AUTH_SECRET_NAME)
+        if managed_codex_credential or fallback_secret is not None:
+            # Pass the fallback secret directly to the EventService; the stored
+            # record no longer carries secrets.
+            injected_secrets: dict[str, SecretSource] | None = None
+            if not managed_codex_credential and fallback_secret is not None:
+                injected_secrets = {CODEX_AUTH_SECRET_NAME: fallback_secret}
+            # Reuse the agent we already parsed from base_state.json
+            # above so the load path doesn't read and parse it again.
+            event_service = await self._get_or_load_event_service_locked(
+                conversation_id, agent=reattach_agent, secrets=injected_secrets
+            )
+            if event_service is not None:
+                state = await event_service.get_state()
+                return (
+                    _compose_conversation_info(
+                        event_service.stored,
+                        state,
+                        self._children_of(conversation_id),
+                    ),
+                    False,
+                )
+        conversation_info = await self._conversation_info(
+            conversation_id, existing_record
+        )
+        if conversation_info is None:
+            raise ValueError(
+                f"Persisted conversation {conversation_id} has no base state"
+            )
+        return conversation_info, False
+
     async def start_conversation(
         self, request: StartConversationRequest
     ) -> tuple[ConversationInfo, bool]:
@@ -1429,123 +1443,21 @@ class ConversationService:
         if self._event_services is None:
             raise ValueError("inactive_service")
         conversation_id = request.conversation_id or uuid4()
-        existing_record = self._conversation_records.get(conversation_id)
-        existing_event_service = self._event_services.get(conversation_id)
-        if existing_record is not None or (
-            existing_event_service is not None and existing_event_service.is_open()
-        ):
+        if self._has_conversation(conversation_id):
             async with self._conversation_lifecycle(conversation_id):
-                existing_event_service = self._event_services.get(conversation_id)
-                if (
-                    existing_event_service is not None
-                    and existing_event_service.is_open()
-                ):
-                    # ``is_open()`` above guarantees a live conversation, so the
-                    # public getter never raises here.
-                    existing_agent = existing_event_service.get_conversation().agent
-                    if (
-                        self._is_codex_agent(existing_agent)
-                        and CODEX_AUTH_SECRET_NAME
-                        not in existing_event_service.credential_bindings
-                    ):
-                        # Reuse the live agent we already resolved above instead
-                        # of letting _resolve_credential_bindings fall back to a
-                        # synchronous base_state.json read.
-                        late_bindings = await self._resolve_credential_bindings(
-                            existing_event_service.stored, agent=existing_agent
-                        )
-                        try:
-                            for secret_name, binding in late_bindings.items():
-                                await (
-                                    existing_event_service.activate_credential_binding(
-                                        secret_name,
-                                        binding,
-                                    )
-                                )
-                        except Exception:
-                            pending = self._credential_bindings.setdefault(
-                                conversation_id, {}
-                            )
-                            for secret_name, binding in late_bindings.items():
-                                pending.setdefault(secret_name, binding)
-                            raise
-                    if (
-                        CODEX_AUTH_SECRET_NAME in request.secrets
-                        and CODEX_AUTH_SECRET_NAME
-                        not in existing_event_service.credential_bindings
-                    ):
-                        await existing_event_service.apply_resume_secrets(
-                            {
-                                CODEX_AUTH_SECRET_NAME: request.secrets[
-                                    CODEX_AUTH_SECRET_NAME
-                                ]
-                            }
-                        )
-                    state = await existing_event_service.get_state()
-                    self._conversation_records[conversation_id] = _ConversationRecord(
-                        stored=existing_event_service.stored,
-                        execution_status=state.execution_status,
-                    )
-                    return (
-                        _compose_conversation_info(
-                            existing_event_service.stored,
-                            state,
-                            self._children_of(conversation_id),
-                        ),
-                        False,
-                    )
-                if existing_record is None:
-                    raise ValueError(
-                        f"Persisted conversation {conversation_id} has no record"
-                    )
-                # Read base_state.json off the event loop, matching the
-                # asyncio.to_thread pattern used for the same read elsewhere
-                # (_resolve_credential_bindings, _conversation_info).
-                reattach_agent = await asyncio.to_thread(
-                    self._agent_from_base_state, conversation_id
+                return await self._reuse_existing_conversation_locked(
+                    conversation_id, request
                 )
-                managed_codex_credential = self._is_codex_agent(reattach_agent) and (
-                    CODEX_AUTH_SECRET_NAME
-                    in self._credential_bindings.get(conversation_id, {})
-                    or await self._has_local_codex_credential()
-                )
-                fallback_secret = request.secrets.get(CODEX_AUTH_SECRET_NAME)
-                if managed_codex_credential or fallback_secret is not None:
-                    injected_fallback = (
-                        not managed_codex_credential and fallback_secret is not None
-                    )
-                    # Pass the CODEX secret directly to the EventService instead
-                    # of mutating stored (StoredConversation no longer carries secrets).
-                    injected_secrets: dict[str, SecretSource] | None = None
-                    if injected_fallback:
-                        assert fallback_secret is not None
-                        injected_secrets = {CODEX_AUTH_SECRET_NAME: fallback_secret}
-                    # Reuse the agent we already parsed from base_state.json
-                    # above so the load path doesn't read and parse it again.
-                    event_service = await self._get_or_load_event_service_locked(
-                        conversation_id,
-                        agent=reattach_agent,
-                        secrets=injected_secrets,
-                    )
-                    if event_service is not None:
-                        state = await event_service.get_state()
-                        return (
-                            _compose_conversation_info(
-                                event_service.stored,
-                                state,
-                                self._children_of(conversation_id),
-                            ),
-                            False,
-                        )
-                conversation_info = await self._conversation_info(
-                    conversation_id, existing_record
-                )
-            if conversation_info is None:
-                raise ValueError(
-                    f"Persisted conversation {conversation_id} has no base state"
-                )
-            return conversation_info, False
 
+        with await RunSlot.acquire(self._run_semaphore) as run_slot:
+            return await self._create_conversation(request, conversation_id, run_slot)
+
+    async def _create_conversation(
+        self,
+        request: StartConversationRequest,
+        conversation_id: UUID,
+        run_slot: RunSlot,
+    ) -> tuple[ConversationInfo, bool]:
         # The link is immutable after creation, so cycles beyond self-parent are
         # impossible; allowing reparenting would require a real ancestor walk.
         if request.parent_conversation_id is not None:
@@ -1566,10 +1478,12 @@ class ConversationService:
                     f"to a different workspace"
                 )
 
-        # Profile resolution and the load_memory stamp must happen before
-        # _prepare_request_workspace (which asserts request.agent is not None)
-        # and before model_dump so the resolved agent is captured in request_data.
-        launched_agent_profile: LaunchedAgentProfile | None = None
+        runtime_profile = os.getenv("OH_RUNTIME_LAUNCHED_PROFILE")
+        runtime_launched_profile = (
+            LaunchedAgentProfile.model_validate_json(runtime_profile)
+            if runtime_profile
+            else None
+        )
 
         from openhands.agent_server.persistence import (
             PersistedSettings,
@@ -1591,75 +1505,26 @@ class ConversationService:
                 exc_info=True,
             )
             settings = PersistedSettings()
-
         # ``ACPAgentSettings.agent_context`` is nullable, hence the guard.
         stored_context = settings.agent_settings.agent_context
         load_memory = bool(stored_context and stored_context.load_memory)
 
-        if request.agent_profile_id is not None:
-            mcp_config = settings.agent_settings.mcp_config
-            resolved_agent, launched_agent_profile = await asyncio.to_thread(
-                _resolve_agent_from_profile,
-                request.agent_profile_id,
-                self.cipher,
-                mcp_config,
-                acp_skill_sourcing=self.acp_skill_sourcing,
-            )
-            request = request.model_copy(update={"agent": resolved_agent})
-
-        # Applied unconditionally: a serialized agent always carries
-        # ``load_memory`` (model_dump emits defaults), so there is no way to
-        # tell a deliberate ``false`` from an echoed one. Opting a single
-        # conversation out needs a tri-state field; tracked separately.
-        if load_memory and request.agent is not None:
-            request = request.model_copy(
-                update={"agent": _with_load_memory(request.agent)}
-            )
-
-        request = request.model_copy(
-            update={
-                "agent": _apply_acp_skill_sourcing(
-                    request.agent, self.acp_skill_sourcing
-                )
-            }
+        source = await asyncio.to_thread(
+            launch_source,
+            request,
+            lambda: server_launch_stores(settings, self.cipher),
+            self.cipher,
         )
-
-        additions = request.agent_launch_additions
-        suffix = (
-            additions.system_message_suffix_append.strip()
-            if additions and additions.system_message_suffix_append
-            else ""
-        )
-        if suffix:
-            request = request.model_copy(
-                update={"agent": _append_system_message_suffix(request.agent, suffix)}
-            )
-
-        request = _prepare_request_workspace(
-            request, conversation_id, self.conversation_worktree_root
-        )
-
-        managed_codex_credential = self._is_codex_agent(request.agent) and (
+        secrets = scoped_secrets(request_secrets(request, self.cipher), source)
+        managed_codex_credential = is_codex_source(source) and (
             CODEX_AUTH_SECRET_NAME in self._credential_bindings.get(conversation_id, {})
             or await self._has_local_codex_credential()
         )
         if managed_codex_credential:
-            durable_secrets = dict(request.secrets)
-            durable_secrets.pop(CODEX_AUTH_SECRET_NAME, None)
-            request = request.model_copy(
-                update={
-                    "secrets": durable_secrets,
-                    "agent": _without_agent_context_secret(
-                        request.agent,
-                        CODEX_AUTH_SECRET_NAME,
-                    ),
-                }
-            )
+            secrets.pop(CODEX_AUTH_SECRET_NAME, None)
 
         # Dynamically register tools from client's registry
         if request.tool_module_qualnames:
-            import importlib
-
             for tool_name, module_qualname in request.tool_module_qualnames.items():
                 try:
                     # Import the module to trigger tool auto-registration
@@ -1675,28 +1540,59 @@ class ConversationService:
                     # Continue even if some tools fail to register
                     # The agent will fail gracefully if it tries to use unregistered
                     # tools
-            if request.tool_module_qualnames:
-                logger.info(
-                    "Dynamically registered %d tools for conversation %s",
-                    len(request.tool_module_qualnames),
-                    conversation_id,
-                )
+            logger.info(
+                "Dynamically registered %d tools for conversation %s",
+                len(request.tool_module_qualnames),
+                conversation_id,
+            )
 
         # Register client-defined tools (JSON specs, no Python code). The
         # ClientTool *class* is registered statelessly; each tool's schema
         # travels with the conversation via the returned Tool.params, so
         # concurrent conversations never clobber each other's schemas.
-        if request.client_tools:
-            client_tool_specs = register_client_tools(request.client_tools)
-            # Inject Tool specs into the agent so _initialize() resolves them
-            existing_names = {t.name for t in request.agent.tools}
-            new_tools = [
-                ts for ts in client_tool_specs if ts.name not in existing_names
-            ]
-            if new_tools:
-                request.agent = request.agent.model_copy(
-                    update={"tools": [*request.agent.tools, *new_tools]}
-                )
+        client_tools = (
+            register_client_tools(request.client_tools) if request.client_tools else []
+        )
+
+        worktree = (
+            _plan_conversation_worktree(
+                request.workspace, conversation_id, self.conversation_worktree_root
+            )
+            if request.worktree
+            else None
+        )
+        launched = await asyncio.to_thread(
+            lambda: finalize(
+                source,
+                live_launch_runtime(
+                    self.acp_skill_sourcing, enable_browser=self.enable_browser
+                ),
+                additions=request.agent_launch_additions,
+                extra_suffixes=[worktree.guidance] if worktree else (),
+                client_tools=client_tools,
+                load_memory=load_memory,
+                managed_secrets=(
+                    [CODEX_AUTH_SECRET_NAME] if managed_codex_credential else ()
+                ),
+            )
+        )
+        workspace = (
+            _create_conversation_worktree(worktree)
+            if worktree is not None
+            else request.workspace
+        )
+
+        # The server may resolve built-in tools that the creating client does not
+        # import, as happens when a lightweight orchestrator starts a runtime
+        # conversation. Persist those server-resolved modules so another client
+        # can attach and deserialize the resulting tool events.
+        registered_tool_modules = get_tool_module_qualnames()
+        tool_module_qualnames = dict(request.tool_module_qualnames)
+        client_tool_names = {tool.name for tool in client_tools}
+        for tool in launched.agent.tools:
+            module_qualname = registered_tool_modules.get(tool.name)
+            if module_qualname is not None and tool.name not in client_tool_names:
+                tool_module_qualnames.setdefault(tool.name, module_qualname)
 
         # Register subagent definitions forwarded from the client
         if request.agent_definitions:
@@ -1705,47 +1601,46 @@ class ConversationService:
                 context=f"conversation {conversation_id}",
             )
 
-        # Plugin loading is now handled lazily by LocalConversation.
-        # Just pass the plugin specs through to StoredConversation.
-        # LocalConversation will:
-        # 1. Fetch and load plugins on first run()/send_message()
-        # 2. Resolve refs to commit SHAs for deterministic resume
-        # 3. Merge plugin skills/MCP/hooks into the agent
+        # Plugin loading is handled lazily by LocalConversation, which fetches
+        # plugins on the first run()/send_message(), pins refs to commit SHAs
+        # and merges plugin skills/MCP/hooks into the agent.
         #
         # Use mode='json' so SecretStr in nested structures (e.g. LookupSecret.headers)
         # serialize to plain strings. Pass expose_secrets=True so StaticSecret values
         # are preserved through the round-trip; the dict is only used in-process to
         # construct StoredConversation, not sent over the network.
-        # Launch-only fields are already folded into stored conversation state.
-        request_data = request.model_dump(
+        request_data = request.model_copy(
+            update={
+                "secrets": secrets,
+                "workspace": workspace,
+                "tool_module_qualnames": tool_module_qualnames,
+            }
+        ).model_dump(
             mode="json",
             context={"expose_secrets": True},
-            exclude={"agent_profile_id", "agent_launch_additions"},
+            exclude={
+                "agent",
+                "agent_settings",
+                "agent_profile_id",
+                "agent_profile",
+                "agent_launch_additions",
+            },
         )
+        launched_agent_profile = launched.profile or runtime_launched_profile
 
-        # Pull out fields that belong to base_state.json (not meta.json) so they
-        # are not splatted into StoredConversation.  The serialized payloads are
-        # kept here for the secrets_encrypted path, which re-validates them with
-        # the cipher to decrypt before passing to EventService.
-        agent_payload = request_data.pop("agent", None)
-        secrets_data = request_data.pop("secrets", {})
-        request_data.pop("secrets_encrypted", None)
-        request_data.pop("confirmation_policy", None)
-        security_analyzer_payload = request_data.pop("security_analyzer", None)
-
-        new_agent: AgentBase = request.agent
-        new_secrets: dict[str, SecretSource] = request.secrets
-        new_security_analyzer: SecurityAnalyzerBase | None = request.security_analyzer
-
-        # If secrets_encrypted=True, the agent's secrets (e.g., LLM api_key) are
-        # cipher-encrypted and need decryption during model validation. Pass the
-        # cipher in the validation context so validate_secret() can decrypt them.
+        # Pull out the init-only fields that belong to base_state.json (not
+        # meta.json) so they are not splatted into StoredConversation. They go
+        # to the EventService directly, decrypted when the request was
+        # secrets_encrypted (``secrets`` above already is).
+        for field_name in (
+            "secrets",
+            "secrets_encrypted",
+            "confirmation_policy",
+            "security_analyzer",
+        ):
+            request_data.pop(field_name, None)
+        new_security_analyzer = request_security_analyzer(request, self.cipher)
         if request.secrets_encrypted:
-            if self.cipher is None:
-                raise ValueError(
-                    "Cannot decrypt secrets: cipher not configured. "
-                    "Set OH_SECRET_KEY environment variable."
-                )
             stored = StoredConversation.model_validate(
                 {
                     "id": conversation_id,
@@ -1758,24 +1653,6 @@ class ConversationService:
                 },
                 context={"cipher": self.cipher},
             )
-            # Decrypt the agent's secrets too (it no longer rides on `stored`).
-            agent_cls = type(request.agent)
-            new_agent = agent_cls.model_validate(
-                agent_payload, context={"cipher": self.cipher}
-            )
-            # Decrypt request secrets separately.
-            _secrets_ta: TypeAdapter[dict[str, SecretSource]] = TypeAdapter(
-                dict[str, SecretSource]
-            )
-            new_secrets = _secrets_ta.validate_python(
-                secrets_data, context={"cipher": self.cipher}
-            )
-            # Decrypt the analyzer's nested credentials (e.g. its guardrail LLM
-            # api_key); like the agent, it no longer rides on `stored`.
-            if request.security_analyzer is not None:
-                new_security_analyzer = type(request.security_analyzer).model_validate(
-                    security_analyzer_payload, context={"cipher": self.cipher}
-                )
         else:
             stored = StoredConversation(
                 id=conversation_id,
@@ -1783,23 +1660,34 @@ class ConversationService:
                 **request_data,
             )
         async with self._conversation_lifecycle(conversation_id):
-            # New conversation: agent, confirmation_policy, security_analyzer,
-            # and secrets are written to base_state.json (their single source of
-            # truth), not to meta.json. Pass them explicitly.
+            # Re-check under the lock. Preparing ``stored`` above awaits, so a
+            # concurrent create for this same id can have committed since the
+            # check at the top of this method. Without this the loser would
+            # start a second EventService for an id that already exists,
+            # re-running its initial message.
+            if self._has_conversation(conversation_id):
+                return await self._reuse_existing_conversation_locked(
+                    conversation_id, request
+                )
+            # New conversation: the agent, confirmation_policy,
+            # security_analyzer, and secrets are written to base_state.json
+            # (their single source of truth), not to meta.json. Pass them
+            # explicitly.
             event_service = await self._start_event_service(
                 stored,
                 is_new_conversation=True,
-                agent=new_agent,
+                launched=launched,
                 confirmation_policy=request.confirmation_policy,
                 security_analyzer=new_security_analyzer,
-                secrets=new_secrets,
+                secrets=secrets,
             )
         initial_message = request.initial_message
         if initial_message:
             message = Message(
                 role=initial_message.role, content=initial_message.content
             )
-            await event_service.send_message(message, True)
+            await event_service.send_message(message, False)
+            await event_service.run(run_slot=run_slot)
 
         state = await event_service.get_state()
         conversation_info = _compose_conversation_info(event_service.stored, state)
@@ -1842,6 +1730,11 @@ class ConversationService:
 
     async def resume_conversation(self, conversation_id: UUID) -> bool:
         return bool(await self._get_or_load_event_service(conversation_id))
+
+    def _worktree_dir(self, stored: StoredConversation) -> Path | None:
+        return conversation_worktree_dir(
+            self.conversation_worktree_root, stored.workspace.working_dir
+        )
 
     async def delete_conversation(self, conversation_id: UUID) -> bool:
         event_services = self._event_services
@@ -1898,6 +1791,13 @@ class ConversationService:
                 event_service.conversation_dir,
                 f"conversation directory for {conversation_id}",
             )
+            worktree_dir = self._worktree_dir(event_service.stored)
+            # Forks share their source's worktree; the last one deleted removes it.
+            if worktree_dir is not None and not any(
+                self._worktree_dir(record.stored) == worktree_dir
+                for record in self._conversation_records.values()
+            ):
+                await asyncio.to_thread(remove_conversation_worktree, worktree_dir)
 
             logger.info(f"Successfully deleted conversation {conversation_id}")
             return True
@@ -1959,6 +1859,17 @@ class ConversationService:
 
     async def get_event_service(self, conversation_id: UUID) -> EventService | None:
         return await self._get_or_load_event_service(conversation_id)
+
+    async def get_persisted_event_service(
+        self, conversation_id: UUID
+    ) -> EventService | None:
+        """Open append-only event history without acquiring a runtime lease."""
+        if self._event_services is None:
+            raise ValueError("inactive_service")
+        record = self._conversation_records.get(conversation_id)
+        if record is None:
+            return None
+        return EventService.for_persisted_events(record.stored, self.conversations_dir)
 
     async def generate_conversation_title(
         self, conversation_id: UUID, max_length: int = 50, llm: LLM | None = None
@@ -2031,61 +1942,64 @@ class ConversationService:
             return None
 
         source_conversation = source_service.get_conversation()
+        fork_conv_id = fork_id or uuid4()
 
-        # fork() deep-copies events, state, and writes to a new persistence dir.
-        fork_conv = await asyncio.to_thread(
-            source_conversation.fork,
-            conversation_id=fork_id,
-            title=title,
-            tags=tags,
-            reset_metrics=reset_metrics,
-            from_event_id=from_event_id,
-        )
-        # Extract the persisted data, then discard the temporary conversation.
-        fork_conv_id = fork_conv.id
-        fork_agent = cast(AgentBase, fork_conv.agent)
-        fork_workspace = fork_conv.workspace
-        fork_conv.delete_on_close = False
-        fork_conv.close()
-
-        # _start_event_service will resume from the persisted fork directory.
-        # Copy the source's stored metadata so request-level configuration
-        # (client_tools, tool_module_qualnames, agent_definitions, plugins, ...)
-        # is preserved on the fork, then override only the fork-specific fields.
-        # Without this, e.g. a fork of a client-tool conversation would lose
-        # ``client_tools`` in meta.json and be unable to re-register its tools
-        # after a server restart.
-        # Note: the agent is NOT stored in meta.json (StoredConversation) — the
-        # fork's agent is already persisted to the fork's base_state.json by
-        # ``source_conversation.fork`` above. It is passed to
-        # ``_start_event_service`` via ``agent=`` for the new-conversation path.
-        # confirmation_policy, security_analyzer, and secrets are also NOT in
-        # meta.json; the fork inherits them from its own base_state.json.
-        fork_overrides: dict[str, Any] = {
-            "id": fork_conv_id,
-            "workspace": fork_workspace,
-            "title": title,
-            "created_at": utc_now(),
-            "updated_at": utc_now(),
-            "forked_from_conversation_id": source_id,
-            "forked_from_event_id": from_event_id,
-        }
-        if reset_metrics:
-            fork_overrides["metrics"] = None
-        if tags is not None:
-            fork_overrides["tags"] = tags
-        fork_stored = source_service.stored.model_copy(update=fork_overrides)
-        # If the service fails to start, clean up the orphaned persistence
-        # directory so we don't leave stale state on disk.
         fork_dir = self.conversations_dir / fork_conv_id.hex
-        try:
-            async with self._conversation_lifecycle(fork_conv_id):
+        async with self._conversation_lifecycle(fork_conv_id):
+            # Re-check under the lock, before fork() writes into ``fork_dir``: a
+            # concurrent fork of the same id can have committed since the check
+            # above, and both fork() and the cleanup below would then touch the
+            # winner's persisted data.
+            if self._has_conversation(fork_conv_id):
+                raise ValueError(f"Conversation with id {fork_id} already exists")
+
+            # fork() deep-copies events and state into ``fork_dir``.
+            fork_conv = await asyncio.to_thread(
+                source_conversation.fork,
+                conversation_id=fork_conv_id,
+                tags=tags,
+                reset_metrics=reset_metrics,
+                from_event_id=from_event_id,
+            )
+            # Extract the persisted data, then discard the temporary conversation.
+            fork_agent = cast(AgentBase, fork_conv.agent)
+            fork_workspace = fork_conv.workspace
+            fork_conv.delete_on_close = False
+            fork_conv.close()
+
+            # _start_event_service will resume from the persisted fork directory.
+            # Copy the source's stored metadata so request-level configuration
+            # (client_tools, tool_module_qualnames, agent_definitions, plugins,
+            # ...) is preserved on the fork, then override only the
+            # fork-specific fields. Without this, e.g. a fork of a client-tool
+            # conversation would lose ``client_tools`` in meta.json and be unable
+            # to re-register its tools after a server restart.
+            # Note: the agent, confirmation_policy, security_analyzer, and
+            # secrets are NOT stored in meta.json (StoredConversation).
+            # ``source_conversation.fork`` above copies them into the fork's
+            # base_state.json, which the fork's EventService resumes from.
+            fork_overrides: dict[str, Any] = {
+                "id": fork_conv_id,
+                "workspace": fork_workspace,
+                "title": title,
+                "tags": tags or {},
+                "created_at": utc_now(),
+                "updated_at": utc_now(),
+                "forked_from_conversation_id": source_id,
+                "forked_from_event_id": from_event_id,
+            }
+            if reset_metrics:
+                fork_overrides["metrics"] = None
+            fork_stored = source_service.stored.model_copy(update=fork_overrides)
+            try:
+                # If the service fails to start, clean up the orphaned
+                # persistence directory so we don't leave stale state on disk.
                 fork_event_service = await self._start_event_service(
-                    fork_stored, is_new_conversation=True, agent=fork_agent
+                    fork_stored, is_new_conversation=True, persisted_agent=fork_agent
                 )
-        except Exception:
-            safe_rmtree(fork_dir)
-            raise
+            except Exception:
+                safe_rmtree(fork_dir)
+                raise
 
         state = await fork_event_service.get_state()
         return _compose_conversation_info(
@@ -2121,6 +2035,7 @@ class ConversationService:
             max_workers=self.max_concurrent_runs,
             thread_name_prefix="conversation-run",
         )
+        self._run_semaphore = asyncio.Semaphore(self.max_concurrent_runs)
         self._event_services = {}
         self._conversation_records = await asyncio.to_thread(self._load_catalog_sync)
 
@@ -2347,6 +2262,7 @@ class ConversationService:
             conversation_idle_ttl_seconds=config.conversation_idle_ttl_seconds,
             conversation_worktree_root=config.conversation_worktree_root,
             acp_skill_sourcing=config.acp_skill_sourcing,
+            enable_browser=config.enable_browser,
         )
 
     async def _start_event_service(
@@ -2354,7 +2270,8 @@ class ConversationService:
         stored: StoredConversation,
         *,
         is_new_conversation: bool = False,
-        agent: AgentBase | None = None,
+        launched: LaunchedAgent | None = None,
+        persisted_agent: AgentBase | None = None,
         confirmation_policy: ConfirmationPolicyBase | None = None,
         security_analyzer: SecurityAnalyzerBase | None = None,
         secrets: dict[str, SecretSource] | None = None,
@@ -2363,20 +2280,21 @@ class ConversationService:
         if event_services is None:
             raise ValueError("inactive_service")
 
-        # ``agent`` is supplied for a NEW conversation (meta.json no longer
-        # carries it). On resume it is ``None`` and both the credential check
-        # and EventService read the agent from base_state.json.
+        # A new conversation starts with the ``launched`` agent (meta.json does
+        # not carry it). Otherwise the agent is read from base_state.json, and
+        # ``persisted_agent`` only spares the credential check that read.
+        agent = launched.agent if launched is not None else persisted_agent
         credential_bindings = await self._resolve_credential_bindings(
             stored, agent=agent
         )
         event_service = EventService(
             stored=stored,
             conversations_dir=self.conversations_dir,
-            agent=agent,
+            agent=launched.agent if launched is not None else None,
             confirmation_policy=confirmation_policy or NeverConfirm(),
             security_analyzer=security_analyzer,
             secrets=secrets or {},
-            cipher=self.cipher,
+            cipher=self._cipher_for(stored.id),
             mcp_tool_provider=self.mcp_tool_provider,
             credential_bindings=credential_bindings,
             owner_instance_id=self.owner_instance_id,
@@ -2386,6 +2304,7 @@ class ConversationService:
         # _renew_all_leases_loop task on ConversationService.
         event_service._external_lease_renewal = True
         event_service._run_executor = self._run_executor
+        event_service._run_semaphore = self._run_semaphore
 
         try:
             await event_service.start()
@@ -2580,15 +2499,20 @@ class _EventSubscriber(Subscriber):
     metadata={OPERATION_METADATA_KEY: "title_generation"},
 )
 def _generate_title_traced(
-    # Unused, but must stay first and positional: ``observe`` re-attaches the
+    # Must stay first and positional: ``observe`` re-attaches the
     # root span it carries, and this runs on a context-less executor thread.
-    conversation: LocalConversation | None,  # noqa: ARG001
+    conversation: LocalConversation | None,
     message: str,
     llm: LLM | None,
     max_length: int,
     on_error: Callable[[Exception], None] | None = None,
 ) -> str:
-    return generate_title_from_message(message, llm, max_length, on_error=on_error)
+    call_context = (
+        conversation.get_llm_call_context() if conversation else LLMCallContext()
+    )
+    return generate_title_from_message(
+        message, llm, max_length, call_context=call_context, on_error=on_error
+    )
 
 
 @dataclass
