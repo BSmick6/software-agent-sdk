@@ -147,8 +147,10 @@ truth**. `StoredConversation.tags` (persisted to `meta.json`) is a **read-only
 projection** maintained purely for listing and filtering performance — loading
 every `base_state.json` to answer a tag query would defeat the purpose of
 `meta.json`. Do not treat `stored.tags` as an independent store or update it
-without also updating `ConversationState`. Every write path must go through
-`_flush_tags_mutation`, which keeps both in sync.
+without also updating `ConversationState`. Per-key writes go through
+`_mutate_state_tag_sync`, which applies the mutation to `ConversationState` and
+copies the result to `StoredConversation` under the state lock, so concurrent
+per-key writes cannot drop each other's keys.
 
 Key constraints: lowercase alphanumeric only (matches `TAG_KEY_PATTERN`); value
 up to 256 characters.

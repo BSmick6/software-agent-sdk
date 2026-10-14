@@ -377,6 +377,25 @@ def _update_state_tags_sync(
     return state
 
 
+def _mutate_state_tag_sync(
+    state: ConversationState,
+    stored: StoredConversation,
+    key: str,
+    value: str | None,
+) -> bool:
+    # The read-modify-write and the meta.json projection both happen under the
+    # state lock so concurrent per-key mutations cannot drop each other's keys.
+    with state:
+        tags = dict(state.tags)
+        if value is not None:
+            tags[key] = value
+        elif tags.pop(key, None) is None:
+            return False
+        state.tags = tags
+        stored.tags = dict(tags)
+    return True
+
+
 def _compose_webhook_conversation_info_sync(
     stored: StoredConversation, state: ConversationState
 ) -> ConversationInfo:
@@ -1840,24 +1859,31 @@ class ConversationService:
         )
         return True
 
-    async def _flush_tags_mutation(
-        self, event_service: "EventService", conversation_id: UUID
-    ) -> None:
-        """Persist a tag mutation to state, disk, and webhooks.
+    async def _mutate_conversation_tag(
+        self, conversation_id: UUID, key: str, value: str | None
+    ) -> bool | None:
+        """Set (or delete, when ``value`` is None) one tag, then persist it.
 
         Intentionally does NOT update ``stored.updated_at`` — per-key tag
         mutations are metadata-only and must not perturb conversation sort order
         or trigger localStorage-to-server migration checks (see AGENTS.md).
 
-        The state lock is acquired inside ``_update_state_tags_sync`` via
-        ``run_in_executor`` so it does not block the event loop.
+        Returns:
+            True if the tag was mutated, None if deleting a key that does not
+            exist, False if the conversation was not found.
         """
+        event_service = await self._get_or_load_event_service(conversation_id)
+        if event_service is None:
+            return False
+
         loop = asyncio.get_running_loop()
         state = await event_service.get_state()
-        new_tags = dict(event_service.stored.tags)
-        state = await loop.run_in_executor(
-            None, _update_state_tags_sync, state, new_tags
+        mutated = await loop.run_in_executor(
+            None, _mutate_state_tag_sync, state, event_service.stored, key, value
         )
+        if not mutated:
+            return None
+
         record = self._conversation_records.get(conversation_id)
         if record is not None:
             record.stored = event_service.stored
@@ -1867,6 +1893,7 @@ class ConversationService:
             None, _compose_webhook_conversation_info_sync, event_service.stored, state
         )
         await self._notify_conversation_webhooks(conversation_info)
+        return True
 
     async def set_conversation_tag(
         self, conversation_id: UUID, key: str, value: str
@@ -1876,14 +1903,10 @@ class ConversationService:
         Returns:
             bool: True if the tag was set, False if the conversation was not found.
         """
-        event_service = await self._get_or_load_event_service(conversation_id)
-        if event_service is None:
-            return False
-
-        event_service.stored.tags[key] = value
-        await self._flush_tags_mutation(event_service, conversation_id)
-        logger.info("Set tag '%s' on conversation %s", key, conversation_id)
-        return True
+        result = await self._mutate_conversation_tag(conversation_id, key, value)
+        if result:
+            logger.info("Set tag '%s' on conversation %s", key, conversation_id)
+        return bool(result)
 
     async def delete_conversation_tag(
         self, conversation_id: UUID, key: str
@@ -1894,17 +1917,10 @@ class ConversationService:
             True if the tag was removed, None if the key did not exist,
             False if the conversation was not found.
         """
-        event_service = await self._get_or_load_event_service(conversation_id)
-        if event_service is None:
-            return False
-
-        if key not in event_service.stored.tags:
-            return None
-
-        del event_service.stored.tags[key]
-        await self._flush_tags_mutation(event_service, conversation_id)
-        logger.info("Deleted tag '%s' from conversation %s", key, conversation_id)
-        return True
+        result = await self._mutate_conversation_tag(conversation_id, key, None)
+        if result:
+            logger.info("Deleted tag '%s' from conversation %s", key, conversation_id)
+        return result
 
     async def get_event_service(self, conversation_id: UUID) -> EventService | None:
         return await self._get_or_load_event_service(conversation_id)

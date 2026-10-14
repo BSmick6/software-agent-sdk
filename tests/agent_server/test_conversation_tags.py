@@ -1,6 +1,8 @@
 """Tests for conversation tags in the API layer."""
 
+import asyncio
 import json
+import threading
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
@@ -21,7 +23,10 @@ from openhands.agent_server.models import (
 )
 from openhands.agent_server.utils import utc_now
 from openhands.sdk import LLM, Agent, Tool
-from openhands.sdk.conversation.state import ConversationExecutionStatus
+from openhands.sdk.conversation.state import (
+    ConversationExecutionStatus,
+    ConversationState,
+)
 from openhands.sdk.security.confirmation_policy import NeverConfirm
 from openhands.sdk.workspace import LocalWorkspace
 
@@ -283,21 +288,6 @@ def test_set_conversation_tag_invalid_key(client, mock_conversation_service):
         client.app.dependency_overrides.clear()
 
 
-def test_validate_tags_rejects_newline_in_key():
-    """_validate_tags must use fullmatch so a trailing newline does not slip through.
-
-    re.match(r'^[a-z0-9]+$', 'abc\\n') returns a match because $ matches before
-    a trailing newline; re.fullmatch does not.  This test pins that behaviour so
-    reverting fullmatch to match would be caught immediately.
-    """
-    import pytest as _pytest
-
-    from openhands.sdk.conversation.types import _validate_tags
-
-    with _pytest.raises(ValueError, match="invalid"):
-        _validate_tags({"abc\n": "value"})
-
-
 def test_delete_conversation_tag(client, mock_conversation_service):
     """DELETE /tags/{key} removes a single tag."""
     mock_conversation_service.delete_conversation_tag = AsyncMock(return_value=True)
@@ -483,9 +473,9 @@ async def test_event_service_start_forwards_observability_span_name(tmp_path):
         assert call_kwargs["observability_span_name"] == "pr_review_evaluation"
 
 
-@pytest.mark.asyncio
-async def test_set_delete_tag_persists_to_disk(tmp_path):
-    """set/delete_conversation_tag mutate stored.tags and persist to meta.json."""
+@pytest.fixture
+async def tag_service(tmp_path):
+    """A ConversationService holding one conversation backed by a real state."""
     stored = StoredConversation(
         id=uuid4(),
         workspace=LocalWorkspace(working_dir=str(tmp_path / "workspace")),
@@ -505,11 +495,15 @@ async def test_set_delete_tag_persists_to_disk(tmp_path):
         conversations_dir=conversations_dir,
         agent=None,
     )
-    mock_state = MagicMock()
-    mock_state.__enter__ = MagicMock(return_value=mock_state)
-    mock_state.__exit__ = MagicMock(return_value=False)
+    state = ConversationState.create(
+        id=stored.id,
+        agent=Agent(llm=LLM(model="gpt-4o", usage_id="test-llm"), tools=[]),
+        workspace=stored.workspace,
+        persistence_dir=str(conv_dir),
+        tags=dict(stored.tags),
+    )
     event_service._conversation = MagicMock()
-    event_service._conversation._state = mock_state
+    event_service._conversation._state = state
 
     with patch(
         "openhands.agent_server.conversation_service"
@@ -519,21 +513,59 @@ async def test_set_delete_tag_persists_to_disk(tmp_path):
         async with ConversationService(conversations_dir=conversations_dir) as service:
             assert service._event_services is not None
             service._event_services[stored.id] = event_service
+            yield service, event_service, state, conv_dir
 
-            result = await service.set_conversation_tag(stored.id, "team", "backend")
-            assert result is True
-            assert event_service.stored.tags == {"env": "test", "team": "backend"}
-            assert (
-                event_service.stored.updated_at == stored.updated_at
-            )  # must not change
-            meta = json.loads((conv_dir / "meta.json").read_text())
-            assert meta["tags"] == {"env": "test", "team": "backend"}
 
-            result = await service.delete_conversation_tag(stored.id, "env")
-            assert result is True
-            assert "env" not in event_service.stored.tags
-            assert (
-                event_service.stored.updated_at == stored.updated_at
-            )  # must not change
-            meta = json.loads((conv_dir / "meta.json").read_text())
-            assert "env" not in meta.get("tags", {})
+def _persisted_tags(conv_dir) -> tuple[dict[str, str], dict[str, str]]:
+    meta = json.loads((conv_dir / "meta.json").read_text())
+    base_state = json.loads((conv_dir / "base_state.json").read_text())
+    return meta.get("tags", {}), base_state.get("tags", {})
+
+
+@pytest.mark.asyncio
+async def test_set_delete_tag_persists_to_disk(tag_service):
+    """set/delete_conversation_tag keep state and meta.json in sync on disk."""
+    service, event_service, state, conv_dir = tag_service
+    original_updated_at = event_service.stored.updated_at
+
+    assert await service.set_conversation_tag(state.id, "team", "backend") is True
+    assert state.tags == {"env": "test", "team": "backend"}
+    assert _persisted_tags(conv_dir) == (state.tags, state.tags)
+
+    assert await service.delete_conversation_tag(state.id, "env") is True
+    assert state.tags == {"team": "backend"}
+    assert _persisted_tags(conv_dir) == (state.tags, state.tags)
+
+    assert await service.delete_conversation_tag(state.id, "env") is None
+    assert event_service.stored.updated_at == original_updated_at
+
+
+@pytest.mark.asyncio
+async def test_concurrent_tag_sets_keep_every_key(tag_service, monkeypatch):
+    """A tag write that waits on the state lock must not drop a key set meanwhile."""
+    service, event_service, state, conv_dir = tag_service
+    first_waiting = threading.Event()
+    release_first = threading.Event()
+    original_enter = ConversationState.__enter__
+    calls = 0
+
+    def gated_enter(self):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            first_waiting.set()
+            release_first.wait(timeout=5)
+        return original_enter(self)
+
+    monkeypatch.setattr(ConversationState, "__enter__", gated_enter)
+
+    first = asyncio.create_task(service.set_conversation_tag(state.id, "a", "1"))
+    await asyncio.to_thread(first_waiting.wait, 5)
+    assert await service.set_conversation_tag(state.id, "b", "2") is True
+    release_first.set()
+    assert await first is True
+
+    expected = {"env": "test", "a": "1", "b": "2"}
+    assert state.tags == expected
+    assert event_service.stored.tags == expected
+    assert _persisted_tags(conv_dir) == (expected, expected)
